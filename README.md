@@ -103,30 +103,6 @@ python app.py
 python app.py --config continue-deepbill.config.yaml
 ```
 
-## 🧪 Тестирование
-
-### Запуск всех тестов
-
-```bash
-# Тесты адаптера
-python adapter_route_tests.py
-
-# Live-тесты маршрутов
-python live_continue_route_test.py
-
-# Тесты парсера tool-вызовов
-python tool_call_parser_tests.py
-
-# Тесты производительности
-python runtime_tests.py
-```
-
-### Ожидаемые результаты
-
-- `adapter_route_tests.py` — вывод статуса PASS/FAIL для каждого теста
-- `live_continue_route_test.py` — отчёт о доступности эндпоинтов
-- `runtime_tests.py` — бенчмарки времени выполнения
-
 ## 📊 Использование
 
 ### Базовый пример
@@ -181,34 +157,6 @@ status = tester.check_route("/v1/chat/completions", method="POST")
 print(f"Статус: {status}")
 ```
 
-## 📁 Структура проекта
-
-```
-.
-├── adapter_route_tests.py        # Тесты маршрутизации адаптера
-├── adapter_test_run.log           # Лог тестов
-├── app.py                         # Главный сервер
-├── continue-deepbill.config.yaml  # Конфигурация Continue + DeepBill
-├── dbill_settings.json            # Основные настройки
-├── deepseek_profile/              # Профили DeepSeek
-├── deepseek_runtime.py            # DeepSeek runtime
-├── install.sh                     # Установщик для Linux
-├── install_windows.bat            # Установщик для Windows
-├── live_continue_route_test.py    # Live-тесты маршрутов
-├── live_continue_route_test.log   # Лог live-тестов
-├── nohup.out                      # Вывод фонового запуска
-├── openai_adapter.py              # Основной адаптер OpenAI
-├── OPENAI_ADAPTER_GUIDE.md        # Руководство по адаптеру
-├── __pycache__/                   # Кэш байт-кода
-├── README.md                      # Основной README
-├── requirements.txt               # Зависимости Python
-├── run_linux.sh                   # Скрипт запуска для Linux
-├── run_windows.bat                # Скрипт запуска для Windows
-├── runtime_tests.py               # Тесты производительности
-├── TESTING.md                     # Руководство по тестированию
-├── tool_call_parser.py            # Парсер tool-вызовов
-└── tool_call_parser_tests.py      # Тесты парсера
-```
 
 ## 🔍 Логирование и отладка
 
@@ -233,8 +181,7 @@ logging.basicConfig(level=logging.DEBUG)
 |----------|---------|
 | `ModuleNotFoundError: No module named 'openai'` | Установите: `pip install openai` |
 | Ошибка подключения к API | Проверьте `api_endpoint` в `dbill_settings.json` |
-| Tool call не выполняется | Убедитесь, что функция определена в JSON-схеме |
-| Высокая задержка ответа | Запустите `runtime_tests.py` для бенчмарка |
+| Tool call не выполняется | Убедитесь, что системный промт вашего плагина прописан верно.
 
 ## 🤝 Вклад в проект
 
