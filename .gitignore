@@ -1,0 +1,11 @@
+.venv/
+deepseek_profile/
+__pycache__/
+*.py[cod]
+*.log
+nohup.out
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db

@@ -1,11 +1,6 @@
 {
-  "openai": {
-    "api_key": "YOUR_OPENAI_API_KEY_HERE",
-    "base_url": "https://api.openai.com/v1",
-    "timeout": 60
-  },
-  "deepseek": {
-    "deepseek_path": "deepseek",
-    "working_dir": "."
-  }
+  "adapter_enabled": true,
+  "adapter_port": 8080,
+  "timeout_sec": 360,
+  "answer_stable_sec": 2.5
 }

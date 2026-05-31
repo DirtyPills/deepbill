@@ -1,0 +1,37 @@
+name: DeepBill Local Agent
+version: 1.0.0
+schema: v1
+
+models:
+  - name: DeepBill DeepSeek
+    provider: openai
+    model: deepseek-chat
+    apiBase: http://127.0.0.1:8080/v1
+    apiKey: local
+    roles:
+      - chat
+      - edit
+      - apply
+    capabilities:
+      - tool_use
+    useResponsesApi: false
+    defaultCompletionOptions:
+      contextLength: 64000
+      maxTokens: 4096
+      temperature: 0.1
+      topP: 0.9
+    requestOptions:
+      timeout: 900000
+
+context:
+  - provider: file
+  - provider: code
+  - provider: diff
+  - provider: terminal
+
+rules:
+  - Use tools for workspace file creation, reading, editing, listing, and terminal actions instead of describing those actions in prose.
+  - Keep tool arguments precise and compact; for small requested files, provide the full intended file content in the tool arguments.
+  - When a task needs multiple actions, continue the tool loop until the requested work is actually complete.
+  - After tool results, either call the next required tool or give a short final confirmation.
+  - Do not include UI labels such as Copy or Download in file contents unless the user explicitly asks for those literal words.
