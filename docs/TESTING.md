@@ -5,15 +5,22 @@
 Run after installation:
 
 ```bash
-.venv/bin/python -m py_compile app.py deepseek_runtime.py openai_adapter.py tool_call_parser.py
-.venv/bin/python runtime_tests.py
-.venv/bin/python tool_call_parser_tests.py
-.venv/bin/python adapter_route_tests.py
+.venv/bin/python -m py_compile app.py deepseek_runtime.py openai_adapter.py tool_call_parser.py scripts/dbill_service.py tests/*.py
+.venv/bin/python tests/runtime_tests.py
+.venv/bin/python tests/tool_call_parser_tests.py
+.venv/bin/python tests/deepseek_dom_tests.py
+.venv/bin/python tests/adapter_route_tests.py
+.venv/bin/python tests/roocode_simulation_tests.py
 ```
 
-`adapter_route_tests.py` uses a deterministic worker and covers plain requests,
-SSE shape, dirty tool-call cleanup, retry behavior, create/read tool chains,
-edit chains, and read/edit/read content propagation.
+`tests/adapter_route_tests.py` uses a deterministic worker and covers plain
+requests, SSE shape, dirty tool-call cleanup, retry behavior, backpressure,
+circuit breaker recovery, create/read tool chains, edit chains, and
+read/edit/read content propagation.
+
+`tests/roocode_simulation_tests.py` runs a Roo Code-like loop with real local
+tool execution, including create/read, multiple tool calls in one assistant
+message, edit/read/terminal, and reasoning model routing.
 
 ## Live browser checks
 
@@ -23,7 +30,7 @@ edit chains, and read/edit/read content propagation.
 4. Run:
 
 ```bash
-.venv/bin/python live_continue_route_test.py --base-url http://127.0.0.1:8080/v1 --timeout 360
+.venv/bin/python tests/live_continue_route_test.py --base-url http://127.0.0.1:8080/v1 --timeout 360
 ```
 
 The live route test uses a sandbox in `/tmp/deepbill_live_continue_tools` and

@@ -19,12 +19,15 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from _path import PROJECT_ROOT
 
-LOG_PATH = Path(__file__).resolve().parent / "live_continue_route_test.log"
+
+LOG_PATH = PROJECT_ROOT / "logs" / "live_continue_route_test.log"
 WORK_DIR = Path("/tmp/deepbill_live_continue_tools")
 
 
 def setup_logging() -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -88,6 +91,38 @@ def require_clean_message(message: dict[str, Any], label: str) -> None:
     raw = json.dumps(message, ensure_ascii=False)
     ui_fragments = ("tool_call Copy Download", "Copy\nDownload", "Downloadtool_call")
     require(not any(fragment in raw for fragment in ui_fragments), f"{label} does not leak DeepSeek UI words")
+    content = str(message.get("content") or "")
+    reasoning_fragments = (
+        "We need to",
+        "The user said",
+        "The user asks",
+        "So just output",
+        "Now we need",
+        "Since no additional tool",
+        "The assistant already",
+        "I need to",
+        "Need to respond",
+        "Нужно ответить",
+        "Теперь нужно",
+        "Мы получили результат",
+        "По инструкции",
+        "Инструменты не нужны",
+        "Обычным текстом",
+    )
+    require(
+        not any(fragment.lower() in content.lower() for fragment in reasoning_fragments),
+        f"{label} does not leak DeepThink reasoning",
+    )
+    require_no_duplicate_tool_calls(message, label)
+
+
+def require_no_duplicate_tool_calls(message: dict[str, Any], label: str) -> None:
+    calls = message.get("tool_calls") or []
+    keys: list[tuple[str, str]] = []
+    for call in calls:
+        function = call.get("function") or {}
+        keys.append((str(function.get("name") or ""), str(function.get("arguments") or "")))
+    require(len(keys) == len(set(keys)), f"{label} has no duplicate identical tool calls")
 
 
 def safe_path(filepath: str) -> Path:

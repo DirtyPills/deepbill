@@ -20,7 +20,7 @@ Client -> DBill OpenAI adapter -> Playwright browser -> DeepSeek Web
 
 ## Continue Example
 
-`continue-deepbill.config.yaml` is included as a starting point. The essential
+`config/continue-deepbill.config.yaml` is included as a starting point. The essential
 values are:
 
 ```yaml

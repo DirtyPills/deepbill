@@ -35,11 +35,66 @@ if not logger.handlers:
 
 
 DEFAULT_MODEL = os.environ.get("DEEPBILL_ADAPTER_MODEL", "deepseek-chat")
+REASONING_MODEL = os.environ.get("DEEPBILL_ADAPTER_REASONING_MODEL", "deepbill-deepthink")
+AUTO_MODEL = os.environ.get("DEEPBILL_ADAPTER_AUTO_MODEL", "deepbill-auto")
 DEFAULT_TIMEOUT_SEC = int(os.environ.get("DEEPBILL_ADAPTER_TIMEOUT", "360"))
 MAX_REQUEST_TIMEOUT_SEC = int(os.environ.get("DEEPBILL_ADAPTER_MAX_TIMEOUT", "1800"))
+REASONING_TIMEOUT_SEC = int(os.environ.get("DEEPBILL_REASONING_TIMEOUT", str(DEFAULT_TIMEOUT_SEC)))
+REASONING_MAX_TIMEOUT_SEC = int(os.environ.get("DEEPBILL_REASONING_MAX_TIMEOUT", str(MAX_REQUEST_TIMEOUT_SEC)))
+NORMAL_CONTEXT_WINDOW_TOKENS = int(os.environ.get("DEEPBILL_CONTEXT_WINDOW_TOKENS", "64000"))
+REASONING_CONTEXT_WINDOW_TOKENS = int(os.environ.get("DEEPBILL_REASONING_CONTEXT_WINDOW_TOKENS", "128000"))
+REASONING_CONTEXT_SOFT_LIMIT = int(os.environ.get("DEEPBILL_REASONING_CONTEXT_SOFT_LIMIT", "24000"))
 MAX_CONTEXT_BUFFER_CHARS = int(os.environ.get("DEEPBILL_ADAPTER_BUFFER_CHARS", "12000"))
 STREAM_TEXT_CHARS = int(os.environ.get("DEEPBILL_ADAPTER_STREAM_CHARS", "140"))
 DEEPSEEK_RETRY_ATTEMPTS = max(0, int(os.environ.get("DEEPBILL_ADAPTER_RETRIES", "1")))
+BROWSER_BUSY_TIMEOUT_SEC = float(os.environ.get("DEEPBILL_ADAPTER_BUSY_TIMEOUT", "5"))
+ADAPTER_QUEUE_LIMIT = max(0, int(os.environ.get("DEEPBILL_ADAPTER_QUEUE_LIMIT", "1")))
+ADAPTER_CIRCUIT_FAILURE_THRESHOLD = max(0, int(os.environ.get("DEEPBILL_ADAPTER_CIRCUIT_FAILURE_THRESHOLD", "3")))
+ADAPTER_CIRCUIT_COOLDOWN_SEC = max(1.0, float(os.environ.get("DEEPBILL_ADAPTER_CIRCUIT_COOLDOWN_SEC", "60")))
+REASONING_FORCE_MODEL_FRAGMENTS = (
+    "deepthink",
+    "reasoner",
+    "reasoning",
+    "r1",
+)
+REASONING_AUTO_MODEL_FRAGMENTS = (
+    "auto",
+)
+
+
+def normalize_reasoning_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    aliases = {
+        "0": "off",
+        "false": "off",
+        "no": "off",
+        "off": "off",
+        "disabled": "off",
+        "нет": "off",
+        "выкл": "off",
+        "auto": "auto",
+        "авто": "auto",
+        "1": "on",
+        "true": "on",
+        "yes": "on",
+        "on": "on",
+        "enabled": "on",
+        "да": "on",
+        "вкл": "on",
+    }
+    return aliases.get(text, "off")
+
+
+class BrowserBusyError(RuntimeError):
+    """Raised when another request is already using the single DeepSeek browser."""
+
+
+class AdapterCircuitOpenError(RuntimeError):
+    """Raised when recent DeepSeek/browser failures temporarily block new work."""
+
+    def __init__(self, message: str, retry_after: float):
+        super().__init__(message)
+        self.retry_after = max(1.0, float(retry_after or 1.0))
 
 
 class OpenAIAdapter:
@@ -55,11 +110,30 @@ class OpenAIAdapter:
         )
         self._tool_call_map: Dict[str, str] = {}
         self._state_lock = threading.Lock()
+        self._browser_request_lock = threading.Lock()
+        self._admission_lock = threading.Lock()
+        self.queue_limit = ADAPTER_QUEUE_LIMIT
+        self.circuit_failure_threshold = ADAPTER_CIRCUIT_FAILURE_THRESHOLD
+        self.circuit_cooldown_sec = ADAPTER_CIRCUIT_COOLDOWN_SEC
+        self._waiting_browser_requests = 0
+        self._active_adapter_request_id = ""
+        self._active_adapter_since: Optional[float] = None
+        self._accepted_requests = 0
+        self._completed_requests = 0
+        self._rejected_backpressure = 0
+        self._rejected_busy_timeout = 0
+        self._circuit_state = "closed"
+        self._circuit_failures = 0
+        self._circuit_open_until = 0.0
+        self._circuit_open_count = 0
+        self._last_circuit_error = ""
+        self._last_circuit_opened_at = 0.0
         self._context_buffers: Dict[str, Deque[str]] = {}
         self._context_buffer_chars: Dict[str, int] = {}
         self.new_chat_mode = os.environ.get("DEEPBILL_ADAPTER_NEW_CHAT_MODE", "auto").strip().lower()
         if self.new_chat_mode not in {"auto", "always", "never"}:
             self.new_chat_mode = "auto"
+        self.default_reasoning_mode = normalize_reasoning_mode(os.environ.get("DEEPBILL_ADAPTER_REASONING_MODE", "off"))
         self._active_conversation_key: Optional[str] = None
         self.context_buffer_enabled = os.environ.get("DEEPBILL_ADAPTER_CONTEXT_BUFFER", "1") != "0"
         self.single_message_new_chat = os.environ.get("DEEPBILL_ADAPTER_SINGLE_MESSAGE_NEW_CHAT", "1") != "0"
@@ -92,8 +166,38 @@ class OpenAIAdapter:
                 {
                     "object": "list",
                     "data": [
-                        {"id": DEFAULT_MODEL, "object": "model", "created": now, "owned_by": "deepbill"},
-                        {"id": "deepbill", "object": "model", "created": now, "owned_by": "deepbill"},
+                        {
+                            "id": DEFAULT_MODEL,
+                            "object": "model",
+                            "created": now,
+                            "owned_by": "deepbill",
+                            "context_length": NORMAL_CONTEXT_WINDOW_TOKENS,
+                            "max_context_tokens": NORMAL_CONTEXT_WINDOW_TOKENS,
+                        },
+                        {
+                            "id": "deepbill",
+                            "object": "model",
+                            "created": now,
+                            "owned_by": "deepbill",
+                            "context_length": NORMAL_CONTEXT_WINDOW_TOKENS,
+                            "max_context_tokens": NORMAL_CONTEXT_WINDOW_TOKENS,
+                        },
+                        {
+                            "id": AUTO_MODEL,
+                            "object": "model",
+                            "created": now,
+                            "owned_by": "deepbill",
+                            "context_length": REASONING_CONTEXT_WINDOW_TOKENS,
+                            "max_context_tokens": REASONING_CONTEXT_WINDOW_TOKENS,
+                        },
+                        {
+                            "id": REASONING_MODEL,
+                            "object": "model",
+                            "created": now,
+                            "owned_by": "deepbill",
+                            "context_length": REASONING_CONTEXT_WINDOW_TOKENS,
+                            "max_context_tokens": REASONING_CONTEXT_WINDOW_TOKENS,
+                        },
                     ],
                 }
             )
@@ -108,10 +212,17 @@ class OpenAIAdapter:
                     payload = {"status": "ok" if ready and not error else "starting", "ready": ready, "error": error}
                     if hasattr(self.browser_worker, "diagnostics"):
                         payload["diagnostics"] = self.browser_worker.diagnostics()
+                    diagnostics = payload.setdefault("diagnostics", {})
+                    if isinstance(diagnostics, dict):
+                        diagnostics["adapter"] = self._adapter_diagnostics()
                     return payload
                 except Exception as exc:
                     return {"status": "error", "ready": False, "error": str(exc)}, 503
-            return {"status": "ok" if ready else "error", "ready": ready}
+            return {
+                "status": "ok" if ready else "error",
+                "ready": ready,
+                "diagnostics": {"adapter": self._adapter_diagnostics()},
+            }
 
         @self.app.route("/test", methods=["GET"])
         def test():
@@ -128,6 +239,18 @@ class OpenAIAdapter:
         resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Client-Request-Id"
         return resp
 
+    @staticmethod
+    def _error_response(
+        message: str,
+        error_type: str,
+        status: int,
+        retry_after: Optional[float] = None,
+    ):
+        resp = jsonify({"error": {"message": message, "type": error_type}})
+        if retry_after is not None:
+            resp.headers["Retry-After"] = str(max(1, int(float(retry_after) + 0.999)))
+        return resp, status
+
     # --------------------------------------------------------------- formatting
     @staticmethod
     def _json(data: Dict[str, Any]) -> str:
@@ -142,6 +265,34 @@ class OpenAIAdapter:
     @staticmethod
     def _new_id(prefix: str = "chatcmpl") -> str:
         return f"{prefix}-{uuid.uuid4().hex[:24]}"
+
+    def _adapter_diagnostics(self) -> Dict[str, Any]:
+        with self._admission_lock:
+            active_for = (
+                time.monotonic() - self._active_adapter_since
+                if self._active_adapter_since is not None
+                else 0.0
+            )
+            retry_after = max(0.0, self._circuit_open_until - time.monotonic())
+            return {
+                "queue_limit": self.queue_limit,
+                "busy_timeout_sec": BROWSER_BUSY_TIMEOUT_SEC,
+                "waiting_requests": self._waiting_browser_requests,
+                "active_request_id": self._active_adapter_request_id,
+                "active_for_sec": round(active_for, 1),
+                "accepted_requests": self._accepted_requests,
+                "completed_requests": self._completed_requests,
+                "rejected_backpressure": self._rejected_backpressure,
+                "rejected_busy_timeout": self._rejected_busy_timeout,
+                "circuit_state": self._circuit_state,
+                "circuit_failures": self._circuit_failures,
+                "circuit_failure_threshold": self.circuit_failure_threshold,
+                "circuit_cooldown_sec": self.circuit_cooldown_sec,
+                "circuit_retry_after_sec": round(retry_after, 1),
+                "circuit_open_count": self._circuit_open_count,
+                "last_circuit_error": self._last_circuit_error,
+                "last_circuit_opened_at": round(self._last_circuit_opened_at, 3),
+            }
 
     @staticmethod
     def _content_to_text(content: Any) -> str:
@@ -189,6 +340,59 @@ class OpenAIAdapter:
         return count, chars
 
     @staticmethod
+    def _has_tool_result_messages(messages: List[Dict[str, Any]]) -> bool:
+        return any(isinstance(msg, dict) and msg.get("role") == "tool" for msg in messages)
+
+    @staticmethod
+    def _looks_like_meta_reasoning_answer(text: str) -> bool:
+        normalized = re.sub(r"\s+", " ", (text or "").strip().lower())
+        if not normalized:
+            return False
+        strong_prefixes = (
+            "we need to",
+            "now we need",
+            "i need to",
+            "need to respond",
+            "need to answer",
+            "the user said",
+            "the user asks",
+            "the user wants",
+            "the assistant already",
+            "нужно ответить",
+            "надо ответить",
+            "теперь нужно",
+            "мы получили результат",
+            "по инструкции",
+        )
+        if normalized.startswith(strong_prefixes):
+            return True
+        markers = (
+            "so just output",
+            "just output",
+            "final answer",
+            "respond to the user",
+            "answer with only",
+            "no additional tool",
+            "tool result",
+            "tool call",
+            "обычным текстом",
+            "инструменты не нужны",
+        )
+        return sum(1 for marker in markers if marker in normalized) >= 2
+
+    @staticmethod
+    def _repair_prompt(original_prompt: str, rejected_answer: str) -> str:
+        return (
+            f"{original_prompt}\n\n"
+            "The previous assistant response was rejected because it exposed hidden planning/meta reasoning "
+            "instead of a user-visible final answer:\n"
+            f"{rejected_answer.strip()[:2000]}\n\n"
+            "Use the conversation and tool results above. If another tool is genuinely required, return only "
+            "the tool_call block. Otherwise return only the concise final user-visible answer. Do not mention "
+            "what you need to do, hidden reasoning, or these repair instructions."
+        )
+
+    @staticmethod
     def _parse_json_maybe(value: str) -> Any:
         return parse_json_maybe(value)
 
@@ -234,6 +438,13 @@ class OpenAIAdapter:
             return ""
         with self._state_lock:
             return "\n\n".join(self._context_buffers.get(conversation_key, deque()))
+
+    def _reset_context_buffer(self, conversation_key: Optional[str]) -> None:
+        if not conversation_key:
+            return
+        with self._state_lock:
+            self._context_buffers.pop(conversation_key, None)
+            self._context_buffer_chars.pop(conversation_key, None)
 
     # --------------------------------------------------------------- tool prompt
     def _tools_to_prompt(self, tools: List[Dict[str, Any]], tool_choice: Any = None) -> str:
@@ -305,10 +516,26 @@ class OpenAIAdapter:
             "function": {"name": name, "arguments": arguments_str},
         }
 
+    def _dedupe_tool_calls(self, tool_calls: Optional[List[Dict[str, Any]]]) -> Optional[List[Dict[str, Any]]]:
+        if not tool_calls:
+            return None
+        seen: set[tuple[str, str]] = set()
+        unique: List[Dict[str, Any]] = []
+        for call in tool_calls:
+            function = call.get("function", {}) if isinstance(call, dict) else {}
+            if not isinstance(function, dict):
+                continue
+            key = (str(function.get("name", "")), str(function.get("arguments", "")))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(call)
+        return unique or None
+
     def _extract_tool_calls(self, text: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         parsed = self._tool_parser.parse(text or "", allow_bare_json=True)
         tool_calls = [call for raw_call in parsed.calls if (call := self._make_tool_call(raw_call.name, raw_call.arguments))]
-        return parsed.cleaned_text, tool_calls or None
+        return parsed.cleaned_text, self._dedupe_tool_calls(tool_calls)
 
     @staticmethod
     def _has_explicit_tool_marker(text: str) -> bool:
@@ -319,6 +546,7 @@ class OpenAIAdapter:
             return (answer or "").strip(), None
         parsed = self._tool_parser.parse(answer or "", allow_bare_json=allow_tool_calls)
         tool_calls = [call for raw_call in parsed.calls if (call := self._make_tool_call(raw_call.name, raw_call.arguments))]
+        tool_calls = self._dedupe_tool_calls(tool_calls)
         if tool_calls:
             return parsed.cleaned_text, tool_calls
         if allow_tool_calls:
@@ -396,7 +624,7 @@ class OpenAIAdapter:
         latest_user = self._latest_user_text(messages)
         conversation_key = self._conversation_key(messages)
 
-        if self.context_buffer_enabled and not self._has_history(messages):
+        if self.context_buffer_enabled and not self._has_history(messages) and not self._is_single_user_request(messages):
             with self._state_lock:
                 same_active_conversation = bool(conversation_key and conversation_key == self._active_conversation_key)
             buffered = self._context_buffer_text(conversation_key) if same_active_conversation else ""
@@ -463,9 +691,94 @@ class OpenAIAdapter:
         if transcript:
             prompt_parts.append("Conversation:\n" + transcript)
         prompt_parts.append(
-            "Answer as the assistant. If tool use is required, output only the requested tool_call block(s)."
+            "Answer as the assistant. Return only the final user-visible answer. Do not include analysis, "
+            "reasoning, DeepThink text, hidden thoughts, or meta-commentary about how to answer. "
+            "If tool use is required, output only the requested tool_call block(s)."
         )
         return "\n\n".join(prompt_parts), latest_user
+
+    def _worker_reasoning_mode(self) -> str:
+        worker = self.browser_worker
+        if worker is not None:
+            getter = getattr(worker, "get_reasoning_mode", None)
+            if callable(getter):
+                try:
+                    return normalize_reasoning_mode(getter())
+                except Exception:
+                    pass
+            if hasattr(worker, "reasoning_mode"):
+                try:
+                    return normalize_reasoning_mode(getattr(worker, "reasoning_mode"))
+                except Exception:
+                    pass
+        return self.default_reasoning_mode
+
+    @staticmethod
+    def _model_requests_reasoning(model: str) -> bool:
+        text = (model or "").strip().lower()
+        return any(fragment in text for fragment in REASONING_FORCE_MODEL_FRAGMENTS)
+
+    @staticmethod
+    def _model_requests_auto(model: str) -> bool:
+        text = (model or "").strip().lower()
+        return any(fragment in text for fragment in REASONING_AUTO_MODEL_FRAGMENTS)
+
+    def _auto_reasoning_decision(
+        self,
+        data: Dict[str, Any],
+        prompt: str,
+        latest_user: str,
+    ) -> Tuple[bool, str]:
+        messages = data.get("messages") or []
+        message_count = len(messages) if isinstance(messages, list) else 0
+        tools = data.get("tools") or []
+        tools_count = len(tools) if isinstance(tools, list) else 0
+        tool_message_count, tool_result_chars = (
+            self._content_chars_by_role(messages, "tool") if isinstance(messages, list) else (0, 0)
+        )
+        prompt_tokens = self._prompt_usage_tokens(prompt, request_data=data)
+        if prompt_tokens >= REASONING_CONTEXT_SOFT_LIMIT:
+            return True, f"prompt_tokens>={REASONING_CONTEXT_SOFT_LIMIT}"
+
+        complex_re = re.compile(
+            r"(сложн|архитектур|рефактор|debug|traceback|тест|test|план|проанализ|анализ|"
+            r"исправ|найди|причин|implement|fix|bug|error|ошиб|код|roo|agent|агент|"
+            r"редакт|tool|инструмент|стабильн|завис|лог)",
+            flags=re.IGNORECASE,
+        )
+        complex_task = bool(complex_re.search(latest_user or prompt[:4000]))
+        if tools_count and complex_task:
+            return True, "tools+complex_task"
+        if message_count >= 6 and (tool_result_chars >= 1200 or tool_message_count >= 2):
+            return True, "long_tool_history"
+        if len(latest_user or "") >= 3000 and complex_task:
+            return True, "large_complex_user_request"
+        return False, "simple_request"
+
+    def _decide_use_reasoning(
+        self,
+        data: Dict[str, Any],
+        prompt: str,
+        latest_user: str,
+        model: str,
+    ) -> Tuple[bool, str, str]:
+        worker_mode = self._worker_reasoning_mode()
+        if self._model_requests_reasoning(model):
+            return True, "model", "forced_by_model"
+        mode = "auto" if self._model_requests_auto(model) else worker_mode
+        if mode == "on":
+            return True, mode, "mode_on"
+        if mode == "off":
+            return False, mode, "mode_off"
+        use_reasoning, reason = self._auto_reasoning_decision(data, prompt, latest_user)
+        return use_reasoning, mode, reason
+
+    @staticmethod
+    def _reasoning_timeout(timeout: int, use_reasoning: bool) -> int:
+        if not use_reasoning:
+            return max(5, min(timeout, MAX_REQUEST_TIMEOUT_SEC))
+        target = max(timeout, REASONING_TIMEOUT_SEC)
+        return max(5, min(target, REASONING_MAX_TIMEOUT_SEC))
 
     # -------------------------------------------------------------- deepseek I/O
     def _require_worker(self):
@@ -473,9 +786,118 @@ class OpenAIAdapter:
             raise RuntimeError("Browser worker is not attached to the adapter")
         return self.browser_worker
 
-    def _maybe_new_chat(self, messages: Optional[List[Dict[str, Any]]] = None) -> None:
-        if not self._should_start_new_chat(messages or []):
+    def _raise_if_circuit_open_locked(self) -> None:
+        if self.circuit_failure_threshold <= 0:
+            self._circuit_state = "disabled"
             return
+        now = time.monotonic()
+        if self._circuit_open_until > now:
+            retry_after = self._circuit_open_until - now
+            raise AdapterCircuitOpenError(
+                f"DeepSeek adapter circuit is open after repeated failures; retry in {retry_after:.1f}s",
+                retry_after=retry_after,
+            )
+        if self._circuit_state == "open":
+            self._circuit_state = "half_open"
+
+    def _mark_request_active_locked(self, request_id: Optional[str]) -> None:
+        self._active_adapter_request_id = str(request_id or "")
+        self._active_adapter_since = time.monotonic()
+        self._accepted_requests += 1
+
+    def _acquire_browser_request(self, request_id: Optional[str] = None) -> None:
+        timeout = max(0.0, BROWSER_BUSY_TIMEOUT_SEC)
+        with self._admission_lock:
+            self._raise_if_circuit_open_locked()
+
+        acquired = self._browser_request_lock.acquire(blocking=False)
+        if acquired:
+            with self._admission_lock:
+                try:
+                    self._raise_if_circuit_open_locked()
+                except Exception:
+                    self._browser_request_lock.release()
+                    raise
+                self._mark_request_active_locked(request_id)
+            return
+
+        with self._admission_lock:
+            self._raise_if_circuit_open_locked()
+            if self._waiting_browser_requests >= self.queue_limit:
+                self._rejected_backpressure += 1
+                active_for = (
+                    time.monotonic() - self._active_adapter_since
+                    if self._active_adapter_since is not None
+                    else 0.0
+                )
+                raise BrowserBusyError(
+                    "DeepSeek browser request queue is full "
+                    f"(active_for={active_for:.1f}s, waiting={self._waiting_browser_requests}, "
+                    f"queue_limit={self.queue_limit})"
+                )
+            self._waiting_browser_requests += 1
+
+        try:
+            if timeout:
+                acquired = self._browser_request_lock.acquire(timeout=timeout)
+            else:
+                acquired = self._browser_request_lock.acquire(blocking=False)
+        finally:
+            with self._admission_lock:
+                self._waiting_browser_requests = max(0, self._waiting_browser_requests - 1)
+
+        if not acquired:
+            with self._admission_lock:
+                self._rejected_busy_timeout += 1
+            raise BrowserBusyError(
+                f"DeepSeek browser is busy with another request for more than {timeout:g} seconds"
+            )
+        with self._admission_lock:
+            try:
+                self._raise_if_circuit_open_locked()
+            except Exception:
+                self._browser_request_lock.release()
+                raise
+            self._mark_request_active_locked(request_id)
+
+    def _release_browser_request(self) -> None:
+        with self._admission_lock:
+            self._active_adapter_request_id = ""
+            self._active_adapter_since = None
+        self._browser_request_lock.release()
+
+    def _record_adapter_success(self) -> None:
+        with self._admission_lock:
+            self._completed_requests += 1
+            if self.circuit_failure_threshold > 0:
+                self._circuit_state = "closed"
+                self._circuit_failures = 0
+                self._circuit_open_until = 0.0
+                self._last_circuit_error = ""
+
+    def _record_adapter_failure(self, exc: Exception) -> None:
+        if self.circuit_failure_threshold <= 0:
+            return
+        with self._admission_lock:
+            self._circuit_failures += 1
+            self._last_circuit_error = str(exc)
+            if self._circuit_failures >= self.circuit_failure_threshold:
+                self._circuit_state = "open"
+                self._circuit_open_until = time.monotonic() + self.circuit_cooldown_sec
+                self._circuit_open_count += 1
+                self._last_circuit_opened_at = time.time()
+                logger.warning(
+                    "stage=adapter_circuit_open failures=%s cooldown=%ss error=%s",
+                    self._circuit_failures,
+                    self.circuit_cooldown_sec,
+                    exc,
+                )
+
+    def _maybe_new_chat(self, messages: Optional[List[Dict[str, Any]]] = None) -> None:
+        messages = messages or []
+        if not self._should_start_new_chat(messages):
+            return
+        self._reset_context_buffer(self._conversation_key(messages))
         self._force_new_chat("conversation_boundary")
 
     @staticmethod
@@ -491,10 +913,17 @@ class OpenAIAdapter:
             "browser has been closed",
             "execution context was destroyed",
             "not attached to the dom",
+            "chat length limit",
+            "length limit reached",
             "не принял сообщение",
             "поле ввода не очистилось",
         )
         return any(fragment in text for fragment in retryable_fragments)
+
+    @staticmethod
+    def _is_browser_busy_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return "browser is busy" in text or "browser worker is recovering after timeout" in text
 
     def _force_new_chat(self, reason: str) -> bool:
         worker = self._require_worker()
@@ -508,55 +937,211 @@ class OpenAIAdapter:
             logger.warning("stage=deepseek_new_chat_failed reason=%s error=%s", reason, exc)
             return False
 
-    def _ask_text(self, prompt: str, timeout: int, messages: Optional[List[Dict[str, Any]]] = None) -> str:
-        worker = self._require_worker()
-        self._maybe_new_chat(messages)
-        attempts = DEEPSEEK_RETRY_ATTEMPTS + 1
-        last_error: Optional[Exception] = None
-        for attempt in range(1, attempts + 1):
-            try:
-                return str(worker.ask_text(prompt=prompt, timeout=timeout) or "").strip()
-            except Exception as exc:
-                last_error = exc
-                if attempt >= attempts or not self._is_retryable_deepseek_error(exc):
-                    raise
-                logger.warning(
-                    "stage=deepseek_retry mode=sync attempt=%s/%s error=%s",
-                    attempt + 1,
-                    attempts,
-                    exc,
+    @staticmethod
+    def _worker_ask_text(
+        worker: Any,
+        prompt: str,
+        timeout: int,
+        use_reasoning: bool,
+        request_id: Optional[str] = None,
+    ) -> str:
+        try:
+            return str(
+                worker.ask_text(
+                    prompt=prompt,
+                    timeout=timeout,
+                    use_reasoning=use_reasoning,
+                    request_id=request_id,
                 )
-                self._force_new_chat("retry_after_error")
-        raise last_error or RuntimeError("DeepSeek request failed")
+                or ""
+            ).strip()
+        except TypeError as exc:
+            if "request_id" not in str(exc) and "use_reasoning" not in str(exc):
+                raise
+        try:
+            return str(worker.ask_text(prompt=prompt, timeout=timeout, use_reasoning=use_reasoning) or "").strip()
+        except TypeError as exc:
+            if "use_reasoning" not in str(exc):
+                raise
+            return str(worker.ask_text(prompt=prompt, timeout=timeout) or "").strip()
+
+    @staticmethod
+    def _worker_ask_text_stream(
+        worker: Any,
+        prompt: str,
+        timeout: int,
+        use_reasoning: bool,
+        request_id: Optional[str] = None,
+    ) -> Iterable[str]:
+        if hasattr(worker, "ask_text_stream"):
+            try:
+                yield from worker.ask_text_stream(
+                    prompt=prompt,
+                    timeout=timeout,
+                    use_reasoning=use_reasoning,
+                    request_id=request_id,
+                )
+                return
+            except TypeError as exc:
+                if "request_id" not in str(exc) and "use_reasoning" not in str(exc):
+                    raise
+            try:
+                yield from worker.ask_text_stream(prompt=prompt, timeout=timeout, use_reasoning=use_reasoning)
+                return
+            except TypeError as exc:
+                if "use_reasoning" not in str(exc):
+                    raise
+                yield from worker.ask_text_stream(prompt=prompt, timeout=timeout)
+                return
+        yield OpenAIAdapter._worker_ask_text(worker, prompt, timeout, use_reasoning, request_id=request_id)
+
+    def _ask_text(
+        self,
+        prompt: str,
+        timeout: int,
+        messages: Optional[List[Dict[str, Any]]] = None,
+        use_reasoning: bool = False,
+        request_id: Optional[str] = None,
+    ) -> str:
+        worker = self._require_worker()
+        self._acquire_browser_request(request_id=request_id)
+        try:
+            self._maybe_new_chat(messages)
+            attempts = DEEPSEEK_RETRY_ATTEMPTS + 1
+            last_error: Optional[Exception] = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    answer = self._worker_ask_text(worker, prompt, timeout, use_reasoning, request_id=request_id)
+                    self._record_adapter_success()
+                    return answer
+                except Exception as exc:
+                    if self._is_browser_busy_error(exc):
+                        raise BrowserBusyError(str(exc)) from exc
+                    last_error = exc
+                    if attempt >= attempts or not self._is_retryable_deepseek_error(exc):
+                        raise
+                    logger.warning(
+                        "stage=deepseek_retry mode=sync attempt=%s/%s error=%s",
+                        attempt + 1,
+                        attempts,
+                        exc,
+                    )
+                    self._force_new_chat("retry_after_error")
+            raise last_error or RuntimeError("DeepSeek request failed")
+        except BrowserBusyError:
+            raise
+        except Exception as exc:
+            self._record_adapter_failure(exc)
+            raise
+        finally:
+            self._release_browser_request()
 
     def _ask_text_stream(
         self,
         prompt: str,
         timeout: int,
         messages: Optional[List[Dict[str, Any]]] = None,
+        use_reasoning: bool = False,
+        request_id: Optional[str] = None,
     ) -> Iterable[str]:
         worker = self._require_worker()
-        self._maybe_new_chat(messages)
-        attempts = DEEPSEEK_RETRY_ATTEMPTS + 1
-        for attempt in range(1, attempts + 1):
-            try:
-                if hasattr(worker, "ask_text_stream"):
-                    yield from worker.ask_text_stream(prompt=prompt, timeout=timeout)
+        self._acquire_browser_request(request_id=request_id)
+        try:
+            self._maybe_new_chat(messages)
+            attempts = DEEPSEEK_RETRY_ATTEMPTS + 1
+            for attempt in range(1, attempts + 1):
+                try:
+                    if hasattr(worker, "ask_text_stream"):
+                        yield from self._worker_ask_text_stream(
+                            worker,
+                            prompt,
+                            timeout,
+                            use_reasoning,
+                            request_id=request_id,
+                        )
+                        self._record_adapter_success()
+                        return
+                    answer = self._worker_ask_text(worker, prompt, timeout, use_reasoning, request_id=request_id)
+                    for chunk in self._split_text(answer):
+                        yield chunk
+                    self._record_adapter_success()
                     return
-                answer = str(worker.ask_text(prompt=prompt, timeout=timeout) or "")
-                for chunk in self._split_text(answer):
-                    yield chunk
-                return
-            except Exception as exc:
-                if attempt >= attempts or not self._is_retryable_deepseek_error(exc):
-                    raise
-                logger.warning(
-                    "stage=deepseek_retry mode=stream attempt=%s/%s error=%s",
-                    attempt + 1,
-                    attempts,
-                    exc,
+                except Exception as exc:
+                    if self._is_browser_busy_error(exc):
+                        raise BrowserBusyError(str(exc)) from exc
+                    if attempt >= attempts or not self._is_retryable_deepseek_error(exc):
+                        raise
+                    logger.warning(
+                        "stage=deepseek_retry mode=stream attempt=%s/%s error=%s",
+                        attempt + 1,
+                        attempts,
+                        exc,
+                    )
+                    self._force_new_chat("retry_after_stream_error")
+        except BrowserBusyError:
+            raise
+        except Exception as exc:
+            self._record_adapter_failure(exc)
+            raise
+        finally:
+            self._release_browser_request()
+
+    def _maybe_repair_meta_answer(
+        self,
+        cleaned: str,
+        tool_calls: Optional[List[Dict[str, Any]]],
+        *,
+        has_tools: bool,
+        prompt: str,
+        timeout: int,
+        messages: List[Dict[str, Any]],
+        use_reasoning: bool,
+        request_id: str,
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        if tool_calls:
+            return cleaned, tool_calls
+        if not has_tools or not self._has_tool_result_messages(messages):
+            return cleaned, tool_calls
+        if not self._looks_like_meta_reasoning_answer(cleaned):
+            return cleaned, tool_calls
+
+        repair_prompt = self._repair_prompt(prompt, cleaned)
+        repair_request_id = f"{request_id}-repair"
+        logger.warning(
+            "stage=repair_meta_answer request_id=%s cleaned_chars=%s",
+            request_id,
+            len(cleaned or ""),
+        )
+        try:
+            repaired = self._ask_text(
+                repair_prompt,
+                timeout=timeout,
+                messages=messages,
+                use_reasoning=use_reasoning,
+                request_id=repair_request_id,
+            )
+            repaired_cleaned, repaired_tool_calls = self._parse_assistant_answer(
+                repaired,
+                allow_tool_calls=has_tools,
+            )
+            if repaired_tool_calls or (
+                repaired_cleaned and not self._looks_like_meta_reasoning_answer(repaired_cleaned)
+            ):
+                logger.info(
+                    "stage=repair_meta_answer_done request_id=%s repaired_chars=%s repaired_tool_calls=%s",
+                    request_id,
+                    len(repaired_cleaned or ""),
+                    len(repaired_tool_calls or []),
                 )
-                self._force_new_chat("retry_after_stream_error")
+                return repaired_cleaned, repaired_tool_calls
+            logger.warning(
+                "stage=repair_meta_answer_rejected request_id=%s repaired_preview=%r",
+                request_id,
+                (repaired_cleaned or repaired)[:240],
+            )
+        except Exception as exc:
+            logger.warning("stage=repair_meta_answer_failed request_id=%s error=%s", request_id, exc)
+        return cleaned, tool_calls
 
     # --------------------------------------------------------------- responses
     @staticmethod
@@ -575,9 +1160,57 @@ class OpenAIAdapter:
             start = end
 
     @staticmethod
-    def _usage(prompt: str, answer: str) -> Dict[str, int]:
-        prompt_tokens = max(1, len(prompt) // 4)
-        completion_tokens = max(1, len(answer) // 4) if answer else 0
+    def _estimate_tokens(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, (dict, list)):
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = str(value)
+        if not text:
+            return 0
+        tokens = 0
+        for part in re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE):
+            if len(part) == 1 and not part.isalnum():
+                tokens += 1
+                continue
+            tokens += max(1, (len(part) + 3) // 4)
+        return tokens
+
+    @classmethod
+    def _prompt_usage_tokens(cls, prompt: str, request_data: Optional[Dict[str, Any]] = None) -> int:
+        prompt_tokens = cls._estimate_tokens(prompt)
+        if not request_data:
+            return max(1, prompt_tokens)
+
+        payload_tokens = 0
+        messages = request_data.get("messages") or []
+        if isinstance(messages, list):
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                payload_tokens += 4
+                payload_tokens += cls._estimate_tokens(msg)
+        tools = request_data.get("tools") or []
+        if isinstance(tools, list):
+            for tool in tools:
+                payload_tokens += 8
+                payload_tokens += cls._estimate_tokens(tool)
+        if request_data.get("tool_choice") is not None:
+            payload_tokens += cls._estimate_tokens({"tool_choice": request_data.get("tool_choice")})
+        return max(1, prompt_tokens, payload_tokens)
+
+    @classmethod
+    def _usage(
+        cls,
+        prompt: str,
+        answer: str,
+        tool_calls: Optional[List[Dict[str, Any]]] = None,
+        request_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, int]:
+        prompt_tokens = cls._prompt_usage_tokens(prompt, request_data=request_data)
+        completion_source: Any = tool_calls if tool_calls else answer
+        completion_tokens = cls._estimate_tokens(completion_source) if completion_source else 0
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
@@ -592,6 +1225,7 @@ class OpenAIAdapter:
         prompt: str,
         content: Optional[str],
         tool_calls: Optional[List[Dict[str, Any]]],
+        request_data: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         message: Dict[str, Any] = {"role": "assistant", "content": content or ""}
         finish_reason = "stop"
@@ -605,7 +1239,7 @@ class OpenAIAdapter:
             "created": created,
             "model": model,
             "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
-            "usage": self._usage(prompt, content or ""),
+            "usage": self._usage(prompt, content or "", tool_calls=tool_calls, request_data=request_data),
         }
 
     def _handle_chat_completion(self):
@@ -613,8 +1247,7 @@ class OpenAIAdapter:
         messages = data.get("messages") or []
         model = str(data.get("model") or DEFAULT_MODEL)
         stream = bool(data.get("stream", False))
-        timeout = int(data.get("timeout") or data.get("request_timeout") or DEFAULT_TIMEOUT_SEC)
-        timeout = max(5, min(timeout, MAX_REQUEST_TIMEOUT_SEC))
+        requested_timeout = int(data.get("timeout") or data.get("request_timeout") or DEFAULT_TIMEOUT_SEC)
         request_id = self._new_id()
         created = int(time.time())
         tool_message_count, tool_result_chars = self._content_chars_by_role(messages, "tool") if isinstance(messages, list) else (0, 0)
@@ -632,7 +1265,22 @@ class OpenAIAdapter:
         try:
             prompt, latest_user = self._build_prompt(data)
             conversation_key = self._conversation_key(messages) if isinstance(messages, list) else None
-            logger.info("stage=prompt_built request_id=%s prompt_chars=%s latest_user_chars=%s", request_id, len(prompt), len(latest_user))
+            use_reasoning, reasoning_mode, reasoning_reason = self._decide_use_reasoning(data, prompt, latest_user, model)
+            timeout = self._reasoning_timeout(requested_timeout, use_reasoning)
+            logger.info(
+                "stage=prompt_built request_id=%s prompt_chars=%s latest_user_chars=%s",
+                request_id,
+                len(prompt),
+                len(latest_user),
+            )
+            logger.info(
+                "stage=reasoning_route request_id=%s mode=%s use_reasoning=%s reason=%s timeout=%s",
+                request_id,
+                reasoning_mode,
+                use_reasoning,
+                reasoning_reason,
+                timeout,
+            )
         except Exception as exc:
             logger.exception("Invalid chat completion request")
             return jsonify({"error": {"message": str(exc), "type": "invalid_request_error"}}), 400
@@ -641,14 +1289,45 @@ class OpenAIAdapter:
             return jsonify({"error": {"message": "No user or tool message", "type": "invalid_request_error"}}), 400
 
         if stream:
-            return self._stream_chat_completion(data, prompt, latest_user, conversation_key, request_id, created, model, timeout)
+            return self._stream_chat_completion(
+                data,
+                prompt,
+                latest_user,
+                conversation_key,
+                request_id,
+                created,
+                model,
+                timeout,
+                use_reasoning,
+            )
 
         try:
-            logger.info("stage=deepseek_request request_id=%s mode=sync timeout=%s", request_id, timeout)
-            answer = self._ask_text(prompt, timeout=timeout, messages=messages if isinstance(messages, list) else [])
+            logger.info(
+                "stage=deepseek_request request_id=%s mode=sync timeout=%s reasoning=%s",
+                request_id,
+                timeout,
+                use_reasoning,
+            )
+            answer = self._ask_text(
+                prompt,
+                timeout=timeout,
+                messages=messages if isinstance(messages, list) else [],
+                use_reasoning=use_reasoning,
+                request_id=request_id,
+            )
             logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(answer), answer[:240])
             has_tools = bool(data.get("tools")) and data.get("tool_choice") != "none"
             cleaned, tool_calls = self._parse_assistant_answer(answer, allow_tool_calls=has_tools)
+            cleaned, tool_calls = self._maybe_repair_meta_answer(
+                cleaned,
+                tool_calls,
+                has_tools=has_tools,
+                prompt=prompt,
+                timeout=timeout,
+                messages=messages if isinstance(messages, list) else [],
+                use_reasoning=use_reasoning,
+                request_id=request_id,
+            )
             logger.info(
                 "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s cleaned_chars=%s",
                 request_id,
@@ -658,10 +1337,16 @@ class OpenAIAdapter:
             )
             if not tool_calls:
                 self._append_context_buffer(conversation_key, latest_user, cleaned)
-            return jsonify(self._completion_response(request_id, created, model, prompt, cleaned, tool_calls))
+            return jsonify(self._completion_response(request_id, created, model, prompt, cleaned, tool_calls, data))
+        except AdapterCircuitOpenError as exc:
+            logger.warning("DeepSeek adapter circuit is open")
+            return self._error_response(str(exc), "server_unavailable", 503, retry_after=exc.retry_after)
+        except BrowserBusyError as exc:
+            logger.warning("DeepSeek browser is busy")
+            return self._error_response(str(exc), "server_busy", 429)
         except Exception as exc:
             logger.exception("DeepSeek request failed")
-            return jsonify({"error": {"message": str(exc), "type": "server_error"}}), 500
+            return self._error_response(str(exc), "server_error", 500)
 
     def _stream_chat_completion(
         self,
@@ -673,6 +1358,7 @@ class OpenAIAdapter:
         created: int,
         model: str,
         timeout: int,
+        use_reasoning: bool,
     ):
         has_tools = bool(data.get("tools")) and data.get("tool_choice") != "none"
 
@@ -694,14 +1380,17 @@ class OpenAIAdapter:
                 "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": None}],
             }
 
-        def finish_chunk(reason: str) -> Dict[str, Any]:
-            return {
+        def finish_chunk(reason: str, usage: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+            payload = {
                 "id": request_id,
                 "object": "chat.completion.chunk",
                 "created": created,
                 "model": model,
                 "choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
             }
+            if usage is not None:
+                payload["usage"] = usage
+            return payload
 
         def tool_delta(index: int, delta: Dict[str, Any], finish: Optional[str] = None) -> Dict[str, Any]:
             return {
@@ -722,14 +1411,32 @@ class OpenAIAdapter:
             yield self._sse(role_chunk())
             try:
                 mode = "stream_tools_buffered" if has_tools else "stream_parse_buffered"
-                logger.info("stage=deepseek_request request_id=%s mode=%s timeout=%s", request_id, mode, timeout)
+                logger.info(
+                    "stage=deepseek_request request_id=%s mode=%s timeout=%s reasoning=%s",
+                    request_id,
+                    mode,
+                    timeout,
+                    use_reasoning,
+                )
                 collected = self._ask_text(
                     prompt,
                     timeout=timeout,
                     messages=data.get("messages") if isinstance(data.get("messages"), list) else [],
+                    use_reasoning=use_reasoning,
+                    request_id=request_id,
                 ).strip()
                 logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(collected), collected[:240])
                 cleaned, tool_calls = self._parse_assistant_answer(collected, allow_tool_calls=has_tools)
+                cleaned, tool_calls = self._maybe_repair_meta_answer(
+                    cleaned,
+                    tool_calls,
+                    has_tools=has_tools,
+                    prompt=prompt,
+                    timeout=timeout,
+                    messages=data.get("messages") if isinstance(data.get("messages"), list) else [],
+                    use_reasoning=use_reasoning,
+                    request_id=request_id,
+                )
                 logger.info(
                     "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s cleaned_chars=%s",
                     request_id,
@@ -752,18 +1459,24 @@ class OpenAIAdapter:
                         )
                         for arg_delta in self._split_text(str(func.get("arguments", "")), chunk_size=96):
                             yield self._sse(tool_delta(index, {"function": {"arguments": arg_delta}}))
-                    yield self._sse(finish_chunk("tool_calls"))
+                    yield self._sse(finish_chunk("tool_calls", self._usage(prompt, "", tool_calls=tool_calls, request_data=data)))
                     yield self._sse("[DONE]")
                     return
 
                 for text_delta in self._split_text(cleaned):
                     yield self._sse(content_chunk(text_delta))
                 self._append_context_buffer(conversation_key, latest_user, cleaned)
-                yield self._sse(finish_chunk("stop"))
+                yield self._sse(finish_chunk("stop", self._usage(prompt, cleaned, request_data=data)))
                 yield self._sse("[DONE]")
             except Exception as exc:
                 logger.exception("Streaming DeepSeek request failed")
-                error_payload = {"error": {"message": str(exc), "type": "server_error"}}
+                if isinstance(exc, AdapterCircuitOpenError):
+                    error_type = "server_unavailable"
+                elif isinstance(exc, BrowserBusyError):
+                    error_type = "server_busy"
+                else:
+                    error_type = "server_error"
+                error_payload = {"error": {"message": str(exc), "type": error_type}}
                 yield self._sse(error_payload)
                 yield self._sse("[DONE]")
 
@@ -782,8 +1495,7 @@ class OpenAIAdapter:
         data = request.get_json(silent=True) or {}
         model = str(data.get("model") or DEFAULT_MODEL)
         stream = bool(data.get("stream", False))
-        timeout = int(data.get("timeout") or DEFAULT_TIMEOUT_SEC)
-        timeout = max(5, min(timeout, MAX_REQUEST_TIMEOUT_SEC))
+        requested_timeout = int(data.get("timeout") or DEFAULT_TIMEOUT_SEC)
         prompt_value = data.get("prompt", "")
         if isinstance(prompt_value, list):
             prompt = "\n".join(str(item) for item in prompt_value)
@@ -791,6 +1503,13 @@ class OpenAIAdapter:
             prompt = str(prompt_value or "")
         request_id = self._new_id("cmpl")
         created = int(time.time())
+        use_reasoning, _reasoning_mode, _reasoning_reason = self._decide_use_reasoning(
+            {"messages": [{"role": "user", "content": prompt}]},
+            prompt,
+            prompt,
+            model,
+        )
+        timeout = self._reasoning_timeout(requested_timeout, use_reasoning)
 
         if not prompt.strip():
             return jsonify({"error": {"message": "No prompt", "type": "invalid_request_error"}}), 400
@@ -798,7 +1517,13 @@ class OpenAIAdapter:
         if stream:
             def generate() -> Iterator[str]:
                 try:
-                    for delta in self._ask_text_stream(prompt, timeout=timeout, messages=[]):
+                    for delta in self._ask_text_stream(
+                        prompt,
+                        timeout=timeout,
+                        messages=[],
+                        use_reasoning=use_reasoning,
+                        request_id=request_id,
+                    ):
                         payload = {
                             "id": request_id,
                             "object": "text_completion",
@@ -814,19 +1539,36 @@ class OpenAIAdapter:
                             "created": created,
                             "model": model,
                             "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
+                            "usage": self._usage(prompt, ""),
                         }
                     )
                     yield self._sse("[DONE]")
                 except Exception as exc:
-                    yield self._sse({"error": {"message": str(exc), "type": "server_error"}})
+                    if isinstance(exc, AdapterCircuitOpenError):
+                        error_type = "server_unavailable"
+                    elif isinstance(exc, BrowserBusyError):
+                        error_type = "server_busy"
+                    else:
+                        error_type = "server_error"
+                    yield self._sse({"error": {"message": str(exc), "type": error_type}})
                     yield self._sse("[DONE]")
 
             return Response(stream_with_context(generate()), mimetype="text/event-stream")
 
         try:
-            answer = self._ask_text(prompt, timeout=timeout, messages=[])
+            answer = self._ask_text(
+                prompt,
+                timeout=timeout,
+                messages=[],
+                use_reasoning=use_reasoning,
+                request_id=request_id,
+            )
+        except AdapterCircuitOpenError as exc:
+            return self._error_response(str(exc), "server_unavailable", 503, retry_after=exc.retry_after)
+        except BrowserBusyError as exc:
+            return self._error_response(str(exc), "server_busy", 429)
         except Exception as exc:
-            return jsonify({"error": {"message": str(exc), "type": "server_error"}}), 500
+            return self._error_response(str(exc), "server_error", 500)
         return jsonify(
             {
                 "id": request_id,

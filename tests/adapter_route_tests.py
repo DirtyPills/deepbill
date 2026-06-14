@@ -12,19 +12,24 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
 
+from _path import PROJECT_ROOT
+import openai_adapter as adapter_module
 from openai_adapter import OpenAIAdapter
 
 
-LOG_PATH = Path(__file__).resolve().parent / "adapter_test_run.log"
+LOG_PATH = PROJECT_ROOT / "logs" / "adapter_test_run.log"
 BASE_URL = "http://127.0.0.1:18080/v1"
 
 
 def setup_logging() -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -40,24 +45,91 @@ class DiagnosticWorker:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.prompts: list[str] = []
+        self.reasoning_mode = "off"
         self._fail_once_markers: set[str] = set()
+        self.slow_started = threading.Event()
+        self.slow_release = threading.Event()
+        self.web_search_started = threading.Event()
+        self.web_search_release = threading.Event()
 
     def status(self):
         return True, True, None
 
+    def get_reasoning_mode(self) -> str:
+        return self.reasoning_mode
+
+    def set_reasoning_mode(self, mode: str) -> str:
+        self.reasoning_mode = str(mode or "off")
+        return self.reasoning_mode
+
+    def diagnostics(self) -> dict[str, Any]:
+        last_ask = next((call for call in reversed(self.calls) if call["stage"].startswith("worker.ask_text")), {})
+        return {
+            "reasoning_mode": self.reasoning_mode,
+            "last_use_reasoning": bool(last_ask.get("use_reasoning", False)),
+            "last_web_search_seen": bool(self.web_search_started.is_set()),
+            "last_request_journal": {
+                "request_id": last_ask.get("request_id", ""),
+                "events": [{"stage": "worker.ask_text"}] if last_ask else [],
+            },
+            "watchdog_restarts": 0,
+            "consecutive_hangs": 0,
+        }
+
     def new_chat(self, timeout: int = 30) -> None:
         self.calls.append({"stage": "worker.new_chat", "timeout": timeout})
 
-    def ask_text(self, prompt: str, timeout: int = 180) -> str:
-        self.calls.append({"stage": "worker.ask_text", "timeout": timeout, "prompt_chars": len(prompt)})
+    def ask_text(
+        self,
+        prompt: str,
+        timeout: int = 180,
+        use_reasoning: bool = False,
+        request_id: str = "",
+    ) -> str:
+        self.calls.append(
+            {
+                "stage": "worker.ask_text",
+                "timeout": timeout,
+                "prompt_chars": len(prompt),
+                "use_reasoning": bool(use_reasoning),
+                "request_id": request_id,
+            }
+        )
         self.prompts.append(prompt)
+        if "length limit retry marker" in prompt.lower() and "length limit retry marker" not in self._fail_once_markers:
+            self._fail_once_markers.add("length limit retry marker")
+            raise RuntimeError("DeepSeek chat length limit reached")
         if "retry marker" in prompt.lower() and "retry marker" not in self._fail_once_markers:
             self._fail_once_markers.add("retry marker")
             raise TimeoutError("Таймаут ожидания ответа DeepSeek. Последний фрагмент: ''")
+        if "fatal circuit marker" in prompt.lower():
+            raise RuntimeError("fatal browser failure for circuit breaker")
+        if "slow busy marker" in prompt.lower():
+            self.slow_started.set()
+            self.slow_release.wait(timeout=5)
+            return "slow answer"
+        if "web search marker" in prompt.lower():
+            self.web_search_started.set()
+            self.web_search_release.wait(timeout=5)
+            return "web search final answer"
         return self._answer(prompt)
 
-    def ask_text_stream(self, prompt: str, timeout: int = 180):
-        self.calls.append({"stage": "worker.ask_text_stream", "timeout": timeout, "prompt_chars": len(prompt)})
+    def ask_text_stream(
+        self,
+        prompt: str,
+        timeout: int = 180,
+        use_reasoning: bool = False,
+        request_id: str = "",
+    ):
+        self.calls.append(
+            {
+                "stage": "worker.ask_text_stream",
+                "timeout": timeout,
+                "prompt_chars": len(prompt),
+                "use_reasoning": bool(use_reasoning),
+                "request_id": request_id,
+            }
+        )
         self.prompts.append(prompt)
         answer = self._answer(prompt)
         for idx in range(0, len(answer), 9):
@@ -110,6 +182,17 @@ class DiagnosticWorker:
                 'tool_call Copy Download {"name":"create_new_file",'
                 '"arguments":{"filepath":"test.py","contents":"print(\\"hello\\")"}}'
             )
+        if "duplicate tool marker" in low:
+            return (
+                'tool_call {"name":"create_new_file","arguments":{"filepath":"agent_test.html","contents":"<h1>OK</h1>"}}\n'
+                'tool_call {"name":"create_new_file","arguments":{"filepath":"agent_test.html","contents":"<h1>OK</h1>"}}\n'
+                'tool_call {"name":"create_new_file","arguments":{"filepath":"agent_test.html","contents":"<h1>OK</h1>"}}'
+            )
+        if "direct args tool marker" in low:
+            return (
+                'tool_call\n{"name":"read_file","path":"TOGOSHOL/package.json",'
+                '"mode":"slice","offset":1,"limit":200}'
+            )
         if "prose no native tools marker" in low:
             return (
                 "Для изменения цвета отредактирую style.css.\n\n"
@@ -122,6 +205,10 @@ class DiagnosticWorker:
                 'tool_call\nCopy\nDownload\n{"name":"edit_existing_file",'
                 '"arguments":{"filepath":"style.css","changes":"body {\\n  color: #e67e22;\\n}"}}'
             )
+        if "meta repair marker" in low and "previous assistant response was rejected" in low:
+            return "Готово: файл прочитан и результат учтен."
+        if "meta repair marker" in low and "tool result (read_file" in low:
+            return "We need to read the file after creating it. Then confirm."
         if "glued ui marker" in low:
             return (
                 "text Copy Downloadtool_call Copy Download "
@@ -139,6 +226,10 @@ class DiagnosticWorker:
             return "Готово: результат инструмента учтен."
         if "content array marker" in low:
             return "Контент-массив принят."
+        if "context first marker" in low:
+            return "context first private answer"
+        if "context second marker" in low:
+            return "context second clean answer"
         return "Короткий ответ: 2+2=4."
 
 
@@ -147,10 +238,15 @@ def request_json(path: str, payload: dict[str, Any] | None = None) -> tuple[int,
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
     logging.info("HTTP request path=%s payload=%s", path, payload)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        raw = resp.read().decode("utf-8")
-        logging.info("HTTP response path=%s status=%s body=%s", path, resp.status, raw[:1000])
-        return resp.status, json.loads(raw)
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            logging.info("HTTP response path=%s status=%s body=%s", path, resp.status, raw[:1000])
+            return resp.status, json.loads(raw)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        logging.info("HTTP error path=%s status=%s body=%s", path, exc.code, raw[:1000])
+        return exc.code, json.loads(raw)
 
 
 def request_sse(path: str, payload: dict[str, Any]) -> tuple[int, list[str]]:
@@ -168,6 +264,20 @@ def request_sse(path: str, payload: dict[str, Any]) -> tuple[int, list[str]]:
         return resp.status, events
 
 
+def sse_payloads(events: list[str]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for event in events:
+        text = event.strip()
+        if text == "data: [DONE]":
+            continue
+        if not text.startswith("data: "):
+            continue
+        payload = json.loads(text[len("data: ") :])
+        if isinstance(payload, dict):
+            payloads.append(payload)
+    return payloads
+
+
 def assert_true(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -176,14 +286,19 @@ def assert_true(condition: bool, message: str) -> None:
 
 def main() -> None:
     setup_logging()
+    adapter_module.BROWSER_BUSY_TIMEOUT_SEC = 1.0
     logging.info("=== adapter route tests started ===")
     worker = DiagnosticWorker()
     adapter = OpenAIAdapter(worker, port=18080)
+    adapter.queue_limit = 1
     adapter.start()
     time.sleep(0.8)
 
     status, models = request_json("/models")
     assert_true(status == 200 and models["data"], "models endpoint returns a model list")
+    model_ids = {item["id"] for item in models["data"]}
+    assert_true(adapter_module.AUTO_MODEL in model_ids, "models endpoint exposes auto model alias")
+    assert_true(adapter_module.REASONING_MODEL in model_ids, "models endpoint exposes reasoning model alias")
 
     status, plain = request_json(
         "/chat/completions",
@@ -191,6 +306,152 @@ def main() -> None:
     )
     assert_true(status == 200, "plain chat returns HTTP 200")
     assert_true(plain["choices"][0]["finish_reason"] == "stop", "plain chat finish_reason=stop")
+    assert_true(plain["usage"]["total_tokens"] > 0, "plain chat includes estimated usage")
+    last_plain_call = next(call for call in reversed(worker.calls) if call["stage"] == "worker.ask_text")
+    assert_true(
+        not last_plain_call["use_reasoning"],
+        "default off mode keeps reasoning disabled",
+    )
+    assert_true(last_plain_call["request_id"].startswith("chatcmpl-"), "adapter passes request_id to worker")
+
+    status, forced_reasoning = request_json(
+        "/chat/completions",
+        {
+            "model": adapter_module.REASONING_MODEL,
+            "messages": [{"role": "user", "content": "model switch marker: 2+2?"}],
+            "timeout": 30,
+        },
+    )
+    assert_true(status == 200, "reasoning model alias returns HTTP 200")
+    assert_true(
+        next(call for call in reversed(worker.calls) if call["stage"] == "worker.ask_text")["use_reasoning"],
+        "reasoning model alias forces use_reasoning=True",
+    )
+
+    worker.set_reasoning_mode("on")
+    status, gui_reasoning = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "gui reasoning marker: короткий запрос"}], "timeout": 30},
+    )
+    assert_true(status == 200, "GUI on reasoning mode returns HTTP 200")
+    assert_true(
+        next(call for call in reversed(worker.calls) if call["stage"] == "worker.ask_text")["use_reasoning"],
+        "GUI on mode forces use_reasoning=True",
+    )
+    worker.set_reasoning_mode("off")
+
+    status, health = request_json("/health")
+    assert_true(status == 200, "health endpoint returns HTTP 200")
+    assert_true("diagnostics" in health and "reasoning_mode" in health["diagnostics"], "health exposes reasoning diagnostics")
+    assert_true(
+        "last_request_journal" in health["diagnostics"],
+        "health exposes request journal diagnostics",
+    )
+    assert_true("adapter" in health["diagnostics"], "health exposes adapter queue diagnostics")
+
+    status, auto_simple = request_json(
+        "/chat/completions",
+        {
+            "model": adapter_module.AUTO_MODEL,
+            "messages": [{"role": "user", "content": "auto simple marker: маленький запрос"}],
+            "timeout": 30,
+        },
+    )
+    assert_true(status == 200, "auto model simple request returns HTTP 200")
+    assert_true(
+        not next(call for call in reversed(worker.calls) if call["stage"] == "worker.ask_text")["use_reasoning"],
+        "auto model keeps simple request on normal chat",
+    )
+
+    mini_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file.",
+                "parameters": {"type": "object", "properties": {"filepath": {"type": "string"}}},
+            },
+        }
+    ]
+    status, auto_complex = request_json(
+        "/chat/completions",
+        {
+            "model": adapter_module.AUTO_MODEL,
+            "messages": [{"role": "user", "content": "auto complex marker: проанализируй тест и исправь код"}],
+            "tools": mini_tools,
+            "tool_choice": "none",
+            "timeout": 30,
+        },
+    )
+    assert_true(status == 200, "auto model complex request returns HTTP 200")
+    assert_true(
+        next(call for call in reversed(worker.calls) if call["stage"] == "worker.ask_text")["use_reasoning"],
+        "auto model routes complex tool request to reasoning",
+    )
+
+    slow_result: dict[str, Any] = {}
+
+    def run_slow_http_request() -> None:
+        slow_result["status"], slow_result["body"] = request_json(
+            "/chat/completions",
+            {"messages": [{"role": "user", "content": "slow busy marker: держи браузер занятым"}], "timeout": 30},
+        )
+
+    slow_thread = threading.Thread(target=run_slow_http_request, name="slow-busy-request")
+    slow_thread.start()
+    assert_true(worker.slow_started.wait(timeout=2), "slow request reached the worker")
+    waiting_result: dict[str, Any] = {}
+
+    def run_waiting_http_request() -> None:
+        waiting_result["status"], waiting_result["body"] = request_json(
+            "/chat/completions",
+            {"messages": [{"role": "user", "content": "маленький запрос пока браузер занят"}], "timeout": 30},
+        )
+
+    waiting_thread = threading.Thread(target=run_waiting_http_request, name="queued-busy-request")
+    waiting_thread.start()
+    time.sleep(0.05)
+    status, busy = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "третий запрос при полной очереди"}], "timeout": 30},
+    )
+    assert_true(status == 429, "full adapter queue returns HTTP 429")
+    assert_true(busy["error"]["type"] == "server_busy", "full adapter queue reports server_busy")
+    assert_true("queue is full" in busy["error"]["message"], "full adapter queue explains backpressure")
+    worker.slow_release.set()
+    waiting_thread.join(timeout=5)
+    slow_thread.join(timeout=5)
+    assert_true(slow_result.get("status") == 200, "slow request eventually finishes")
+    assert_true(waiting_result.get("status") == 200, "queued request runs after slow request finishes")
+    status, busy_health = request_json("/health")
+    assert_true(
+        busy_health["diagnostics"]["adapter"]["rejected_backpressure"] >= 1,
+        "adapter diagnostics count backpressure rejects",
+    )
+
+    adapter.queue_limit = 0
+    adapter_module.BROWSER_BUSY_TIMEOUT_SEC = 0.2
+
+    web_search_result: dict[str, Any] = {}
+
+    def run_web_search_http_request() -> None:
+        web_search_result["status"], web_search_result["body"] = request_json(
+            "/chat/completions",
+            {"messages": [{"role": "user", "content": "web search marker: дождись внутреннего поиска"}], "timeout": 30},
+        )
+
+    web_search_thread = threading.Thread(target=run_web_search_http_request, name="web-search-request")
+    web_search_thread.start()
+    assert_true(worker.web_search_started.wait(timeout=2), "web-search-like request reached the worker")
+    status, web_search_busy = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "запрос во время web search"}], "timeout": 30},
+    )
+    assert_true(status == 429, "overlapping request during web search returns HTTP 429")
+    assert_true(web_search_busy["error"]["type"] == "server_busy", "web search overlap reports server_busy")
+    worker.web_search_release.set()
+    web_search_thread.join(timeout=5)
+    assert_true(web_search_result.get("status") == 200, "web-search-like request eventually finishes")
 
     calls_before_retry = len(worker.calls)
     status, retry_plain = request_json(
@@ -208,6 +469,107 @@ def main() -> None:
         any(call["stage"] == "worker.new_chat" for call in retry_calls),
         "retryable timeout opens a fresh DeepSeek chat before retry",
     )
+
+    calls_before_length_limit_retry = len(worker.calls)
+    status, length_limit_retry_plain = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "length limit retry marker: маленький запрос"}], "timeout": 30},
+    )
+    length_limit_retry_calls = worker.calls[calls_before_length_limit_retry:]
+    assert_true(status == 200, "DeepSeek chat length limit recovers with HTTP 200")
+    assert_true(length_limit_retry_plain["choices"][0]["finish_reason"] == "stop", "length limit retry returns final answer")
+    assert_true(
+        len([call for call in length_limit_retry_calls if call["stage"] == "worker.ask_text"]) == 2,
+        "length limit recovery repeats the DeepSeek request once",
+    )
+    assert_true(
+        any(call["stage"] == "worker.new_chat" for call in length_limit_retry_calls),
+        "length limit recovery opens a fresh DeepSeek chat before retry",
+    )
+
+    calls_before_meta_repair = len(worker.calls)
+    status, meta_repair = request_json(
+        "/chat/completions",
+        {
+            "messages": [
+                {"role": "user", "content": "meta repair marker: создай, прочитай и подтверди"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_meta_read",
+                            "type": "function",
+                            "function": {
+                                "name": "read_file",
+                                "arguments": '{"filepath":"agent_test.html"}',
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_meta_read",
+                    "content": "<h1>OK</h1>",
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a small file.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"filepath": {"type": "string"}},
+                            "required": ["filepath"],
+                        },
+                    },
+                }
+            ],
+            "timeout": 30,
+        },
+    )
+    meta_calls = [
+        call for call in worker.calls[calls_before_meta_repair:]
+        if call["stage"] == "worker.ask_text"
+    ]
+    meta_message = meta_repair["choices"][0]["message"]
+    assert_true(status == 200, "meta reasoning final repair returns HTTP 200")
+    assert_true("We need to" not in str(meta_message.get("content") or ""), "meta reasoning final is repaired")
+    assert_true(len(meta_calls) == 2, "meta reasoning final triggers one repair request")
+
+    adapter.circuit_failure_threshold = 2
+    adapter.circuit_cooldown_sec = 1.0
+    status, circuit_first = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "fatal circuit marker: первая ошибка"}], "timeout": 30},
+    )
+    assert_true(status == 500, "first fatal worker error returns HTTP 500")
+    assert_true(circuit_first["error"]["type"] == "server_error", "first fatal worker error reports server_error")
+    status, circuit_second = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "fatal circuit marker: вторая ошибка"}], "timeout": 30},
+    )
+    assert_true(status == 500, "second fatal worker error returns HTTP 500")
+    status, circuit_open = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "запрос пока breaker открыт"}], "timeout": 30},
+    )
+    assert_true(status == 503, "open circuit returns HTTP 503")
+    assert_true(circuit_open["error"]["type"] == "server_unavailable", "open circuit reports server_unavailable")
+    status, circuit_health = request_json("/health")
+    assert_true(
+        circuit_health["diagnostics"]["adapter"]["circuit_state"] == "open",
+        "health exposes open circuit state",
+    )
+    time.sleep(1.2)
+    status, circuit_recovered = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "маленький запрос после breaker"}], "timeout": 30},
+    )
+    assert_true(status == 200, "circuit allows a request after cooldown")
+    assert_true(circuit_recovered["choices"][0]["finish_reason"] == "stop", "post-circuit request finishes normally")
 
     status, dirty_tool = request_json(
         "/chat/completions",
@@ -236,6 +598,71 @@ def main() -> None:
     choice = dirty_tool["choices"][0]
     assert_true(choice["finish_reason"] == "tool_calls", "dirty Continue-style tool marker becomes native tool_calls")
     assert_true(choice["message"]["tool_calls"][0]["function"]["name"] == "create_new_file", "tool name is preserved")
+    assert_true(dirty_tool["usage"]["completion_tokens"] > 0, "tool_call responses include estimated completion tokens")
+
+    status, duplicate_tool = request_json(
+        "/chat/completions",
+        {
+            "messages": [{"role": "user", "content": "duplicate tool marker: создай файл один раз"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "create_new_file",
+                        "description": "Create a small file.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "filepath": {"type": "string"},
+                                "contents": {"type": "string"},
+                            },
+                            "required": ["filepath", "contents"],
+                        },
+                    },
+                }
+            ],
+            "timeout": 30,
+        },
+    )
+    duplicate_choice = duplicate_tool["choices"][0]
+    assert_true(status == 200, "duplicate tool marker returns HTTP 200")
+    assert_true(duplicate_choice["finish_reason"] == "tool_calls", "duplicate marker still becomes tool_calls")
+    assert_true(len(duplicate_choice["message"]["tool_calls"]) == 1, "identical tool calls are deduplicated")
+
+    status, direct_args_tool = request_json(
+        "/chat/completions",
+        {
+            "messages": [{"role": "user", "content": "direct args tool marker: прочитай package.json"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "description": "Read a file.",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string"},
+                                "mode": {"type": "string"},
+                                "offset": {"type": "integer"},
+                                "limit": {"type": "integer"},
+                            },
+                            "required": ["path"],
+                        },
+                    },
+                }
+            ],
+            "timeout": 30,
+        },
+    )
+    direct_choice = direct_args_tool["choices"][0]
+    direct_call = direct_choice["message"]["tool_calls"][0]
+    direct_args = json.loads(direct_call["function"]["arguments"])
+    assert_true(status == 200, "direct-argument DeepSeek tool marker returns HTTP 200")
+    assert_true(direct_choice["finish_reason"] == "tool_calls", "direct-argument marker becomes native tool_calls")
+    assert_true(direct_call["function"]["name"] == "read_file", "direct-argument marker preserves tool name")
+    assert_true(direct_args["path"] == "TOGOSHOL/package.json", "direct path argument reaches Roo-style tools")
+    assert_true(direct_args["mode"] == "slice" and direct_args["limit"] == 200, "direct slice arguments reach Roo-style tools")
 
     status, malformed_code = request_json(
         "/chat/completions",
@@ -392,6 +819,9 @@ def main() -> None:
     )
     assert_true(status == 200, "text streaming returns HTTP 200")
     assert_true(any("data: [DONE]" in event for event in events), "text streaming terminates with [DONE]")
+    text_stream_usage = [payload.get("usage") for payload in sse_payloads(events) if payload.get("usage")]
+    assert_true(bool(text_stream_usage), "text streaming emits estimated usage")
+    assert_true(text_stream_usage[-1]["total_tokens"] > 0, "text streaming usage has total tokens")
 
     status, events = request_sse(
         "/chat/completions",
@@ -418,6 +848,9 @@ def main() -> None:
     assert_true(status == 200, "tool streaming returns HTTP 200")
     assert_true(any('"tool_calls"' in event for event in events), "tool streaming emits tool_calls deltas")
     assert_true(any('"finish_reason":"tool_calls"' in event for event in events), "tool streaming finish_reason=tool_calls")
+    tool_stream_usage = [payload.get("usage") for payload in sse_payloads(events) if payload.get("usage")]
+    assert_true(bool(tool_stream_usage), "tool streaming emits estimated usage")
+    assert_true(tool_stream_usage[-1]["completion_tokens"] > 0, "tool streaming usage counts tool_call tokens")
 
     status, events = request_sse(
         "/chat/completions",
@@ -661,6 +1094,26 @@ def main() -> None:
     )
     assert_true(status == 200, "OpenAI content-array messages are accepted")
     assert_true(content_array["choices"][0]["finish_reason"] == "stop", "content-array chat finishes normally")
+
+    prompts_before_context = len(worker.prompts)
+    status, context_first = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "context first marker: запомни приватный хвост"}], "timeout": 30},
+    )
+    assert_true(status == 200, "context first request returns HTTP 200")
+    status, context_second = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "context second marker: новый чат"}], "timeout": 30},
+    )
+    assert_true(status == 200, "context second request returns HTTP 200")
+    context_prompts = worker.prompts[prompts_before_context:]
+    assert_true(len(context_prompts) == 2, "context reset test records two prompts")
+    assert_true(
+        "context first private answer" not in context_prompts[-1]
+        and "context first marker" not in context_prompts[-1],
+        "new single-user Roo-style chat does not inherit previous context buffer",
+    )
+    assert_true(context_second["usage"]["prompt_tokens"] > 0, "new chat still reports prompt usage")
 
     logging.info("worker calls=%s", worker.calls)
     new_chat_calls = [call for call in worker.calls if call["stage"] == "worker.new_chat"]

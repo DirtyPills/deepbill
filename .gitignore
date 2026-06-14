@@ -4,6 +4,9 @@ __pycache__/
 *.py[cod]
 *.log
 nohup.out
+logs/
+runtime/
+deepbill_debug/
 .env
 .env.*
 !.env.example

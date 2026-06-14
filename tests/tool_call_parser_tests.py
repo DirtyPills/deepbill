@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 
+from _path import PROJECT_ROOT  # noqa: F401
 from tool_call_parser import ToolCallParser
 
 
@@ -45,6 +46,13 @@ def main() -> None:
         "```tool_call\n{'name': 'read_file', 'arguments': {'filepath': 'a.txt'}}\n```"
     )
     assert_true(names(result) == ["read_file"], "fenced Python-literal tool call parses")
+
+    result = parser.parse(
+        'tool_call\n{"name":"read_file","path":"TOGOSHOL/package.json","mode":"slice","offset":1,"limit":200}'
+    )
+    assert_true(names(result) == ["read_file"], "direct-argument DeepSeek tool call parses")
+    assert_true(result.calls[0].arguments["path"] == "TOGOSHOL/package.json", "direct path argument is preserved")
+    assert_true(result.calls[0].arguments["mode"] == "slice", "direct mode argument is preserved")
 
     result = parser.parse(
         '<tool_call><name>list_files</name><arguments>{"path":"."}</arguments></tool_call>'

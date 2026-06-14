@@ -390,10 +390,18 @@ class ToolCallParser:
             calls.extend(self._calls_from_obj({"function": function_call}))
             return calls
 
+        argument_keys = ("arguments", "args", "parameters", "tool_input", "action_input", "input")
+
         func = obj.get("function")
         if isinstance(func, dict):
             name = func.get("name") or obj.get("name")
-            arguments = func.get("arguments", func.get("args", func.get("parameters", {})))
+            arguments = next((func[key] for key in argument_keys if key in func), None)
+            if arguments is None:
+                arguments = {
+                    key: value
+                    for key, value in func.items()
+                    if key not in {"name", "description", "type"} and not key.startswith("_")
+                }
             call = self._make_raw_call(name, arguments)
             return [call] if call else []
 
@@ -404,10 +412,24 @@ class ToolCallParser:
             or obj.get("action")
             or obj.get("function")
         )
-        arguments = obj.get(
-            "arguments",
-            obj.get("args", obj.get("parameters", obj.get("tool_input", obj.get("action_input", obj.get("input", {}))))),
-        )
+        arguments = next((obj[key] for key in argument_keys if key in obj), None)
+        if arguments is None:
+            arguments = {
+                key: value
+                for key, value in obj.items()
+                if key
+                not in {
+                    "name",
+                    "tool_name",
+                    "tool",
+                    "action",
+                    "function",
+                    "function_call",
+                    "tool_calls",
+                    "tools",
+                }
+                and not key.startswith("_")
+            }
         call = self._make_raw_call(name, arguments)
         if call:
             calls.append(call)

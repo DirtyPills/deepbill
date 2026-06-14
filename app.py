@@ -20,6 +20,7 @@ from deepseek_runtime import (
     DEFAULT_TIMEOUT_SEC,
     DEFAULT_USER_DATA_DIR,
     clamp_answer_stable_sec,
+    normalize_reasoning_mode,
 )
 from openai_adapter import OpenAIAdapter
 
@@ -37,6 +38,7 @@ def default_settings() -> dict[str, Any]:
         "adapter_port": 8080,
         "timeout_sec": DEFAULT_TIMEOUT_SEC,
         "answer_stable_sec": DEFAULT_ANSWER_STABLE_SEC,
+        "reasoning_mode": "off",
     }
 
 
@@ -57,11 +59,13 @@ def load_settings(path: Path) -> dict[str, Any]:
     except Exception:
         timeout = int(base["timeout_sec"])
     stable = clamp_answer_stable_sec(raw.get("answer_stable_sec", base["answer_stable_sec"]))
+    reasoning_mode = normalize_reasoning_mode(raw.get("reasoning_mode", base["reasoning_mode"]))
     return {
         "adapter_enabled": bool(raw.get("adapter_enabled", base["adapter_enabled"])),
         "adapter_port": max(1024, min(port, 65535)),
         "timeout_sec": max(30, timeout),
         "answer_stable_sec": stable,
+        "reasoning_mode": reasoning_mode,
     }
 
 
@@ -78,6 +82,7 @@ class DBillChatApp:
             self.settings["timeout_sec"] = max(30, int(timeout_sec))
         self.timeout_sec = int(self.settings["timeout_sec"])
         self.answer_stable_sec = clamp_answer_stable_sec(self.settings["answer_stable_sec"])
+        self.reasoning_mode = normalize_reasoning_mode(self.settings["reasoning_mode"])
         self.adapter_port = int(self.settings["adapter_port"])
         self.openai_adapter: OpenAIAdapter | None = None
 
@@ -91,12 +96,14 @@ class DBillChatApp:
         self.adapter_port_var = tk.StringVar(value=str(self.adapter_port))
         self.timeout_var = tk.StringVar(value=str(self.timeout_sec))
         self.answer_stable_var = tk.StringVar(value=f"{self.answer_stable_sec:g}")
+        self.reasoning_mode_var = tk.StringVar(value=self.reasoning_mode)
         self.chat_prompt_var = tk.StringVar(value="")
 
         self.browser = BrowserWorker(
             headless=headless,
             user_data_dir=user_data_dir,
             answer_stable_sec=self.answer_stable_sec,
+            reasoning_mode=self.reasoning_mode,
         )
         self.browser.start()
         self._build_ui()
@@ -145,6 +152,20 @@ class DBillChatApp:
         ttk.Label(timeout_row, text="Finish wait, sec").pack(side=tk.LEFT, padx=(20, 0))
         ttk.Entry(timeout_row, textvariable=self.answer_stable_var, width=6).pack(side=tk.LEFT, padx=(8, 8))
         ttk.Button(timeout_row, text="Apply Wait", command=self._apply_answer_stable).pack(side=tk.LEFT)
+
+        reasoning_row = ttk.Frame(adapter)
+        reasoning_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Label(reasoning_row, text="Использовать рассуждения").pack(side=tk.LEFT)
+        reasoning_combo = ttk.Combobox(
+            reasoning_row,
+            textvariable=self.reasoning_mode_var,
+            values=("off", "auto", "on"),
+            state="readonly",
+            width=8,
+        )
+        reasoning_combo.pack(side=tk.LEFT, padx=(8, 8))
+        reasoning_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_reasoning_mode())
+        ttk.Button(reasoning_row, text="Apply", command=self._apply_reasoning_mode).pack(side=tk.LEFT)
 
         chat = ttk.LabelFrame(shell, text="Manual Chat", padding=10)
         chat.pack(fill=tk.BOTH, expand=True)
@@ -237,6 +258,14 @@ class DBillChatApp:
         self.settings["answer_stable_sec"] = stable
         self._persist_settings()
         self._log("System", f"Answer finish wait set to {stable:g} seconds.")
+
+    def _apply_reasoning_mode(self) -> None:
+        mode = normalize_reasoning_mode(self.reasoning_mode_var.get())
+        self.reasoning_mode = self.browser.set_reasoning_mode(mode)
+        self.reasoning_mode_var.set(self.reasoning_mode)
+        self.settings["reasoning_mode"] = self.reasoning_mode
+        self._persist_settings()
+        self._log("System", f"Reasoning mode set to {self.reasoning_mode}.")
 
     def _copy_url(self) -> None:
         value = self.adapter_url_var.get().strip()
