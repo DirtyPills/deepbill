@@ -187,6 +187,15 @@ class DeepSeekWebClient:
         "article",
         "div.markdown-body",
     ]
+    USER_MESSAGE_SELECTORS = [
+        "[data-testid*='user']",
+        "[data-role='user']",
+        "[class*='user']",
+        "[class*='human']",
+        "[class*='question']",
+        "[class*='message']",
+        "article",
+    ]
     NEW_CHAT_SELECTORS = [
         "a:has-text('New Chat')",
         "button:has-text('New Chat')",
@@ -388,16 +397,24 @@ class DeepSeekWebClient:
                         self._start_new_chat_locked()
 
                     self._raise_if_cancelled()
+                    self._wait_for_chat_idle_before_send(timeout=min(60, max(10, timeout_sec)))
                     self._set_reasoning_enabled(bool(use_reasoning))
                     input_handle = self._wait_for_input_ready(timeout=60)
+                    self._wait_for_chat_idle_before_send(timeout=min(60, max(10, timeout_sec)))
                     self._raise_if_cancelled()
                     self._journal_event("input_ready")
                     previous_messages = self._get_assistant_messages_texts()
+                    previous_user_messages = self._get_user_messages_texts()
                     self._journal_event("previous_messages_read", count=len(previous_messages))
                     self._focus_and_fill_input(input_handle, message)
                     self._raise_if_cancelled()
                     self._journal_event("prompt_filled")
-                    self._send_current_message(input_handle, previous_messages, message)
+                    self._send_current_message(
+                        input_handle,
+                        previous_messages=previous_messages,
+                        question=message,
+                        previous_user_messages=previous_user_messages,
+                    )
                     self._raise_if_cancelled()
                     self._journal_event("message_sent")
                     try:
@@ -681,6 +698,37 @@ class DeepSeekWebClient:
             raise TimeoutError(f"DeepSeek input not found: {last_error}")
         raise TimeoutError("DeepSeek input not found")
 
+    def _wait_for_chat_idle_before_send(self, timeout: int = 60) -> None:
+        if self._page is None:
+            raise RuntimeError("DeepSeek page is not initialized")
+        deadline = time.monotonic() + max(1, timeout)
+        last_state: Optional[tuple[bool, bool, bool]] = None
+        last_busy: dict[str, Any] = {}
+        while time.monotonic() < deadline:
+            self._raise_if_cancelled()
+            dom = self._get_answer_dom_snapshot()
+            generation_active = bool(dom.get("generation_active")) if isinstance(dom, dict) else False
+            reasoning_active = bool(dom.get("reasoning_active")) if isinstance(dom, dict) else False
+            web_search_active = bool(dom.get("web_search_active")) if isinstance(dom, dict) else False
+            state = (generation_active, reasoning_active, web_search_active)
+            if not any(state):
+                if last_state and any(last_state):
+                    self._journal_event("chat_idle_before_send")
+                return
+            if state != last_state:
+                last_busy = {
+                    "generation_active": generation_active,
+                    "reasoning_active": reasoning_active,
+                    "web_search_active": web_search_active,
+                }
+                self._journal_event("chat_busy_before_send", **last_busy)
+                last_state = state
+            time.sleep(0.35)
+        raise RuntimeError(
+            "DeepSeek chat is still busy before sending a new prompt: "
+            + ", ".join(f"{key}={value}" for key, value in last_busy.items())
+        )
+
     @staticmethod
     def _is_editable_input(element) -> bool:
         try:
@@ -815,7 +863,13 @@ class DeepSeekWebClient:
             return wanted in got or got in wanted
         return wanted[:160] in got and wanted[-160:] in got
 
-    def _send_current_message(self, input_handle, previous_messages: Optional[list[str]] = None, question: str = "") -> None:
+    def _send_current_message(
+        self,
+        input_handle,
+        previous_messages: Optional[list[str]] = None,
+        question: str = "",
+        previous_user_messages: Optional[list[str]] = None,
+    ) -> None:
         if self._page is None:
             raise RuntimeError("DeepSeek page is not initialized")
         self._wait_for_send_enabled(timeout=5)
@@ -830,11 +884,11 @@ class DeepSeekWebClient:
             if ready:
                 button.click()
                 time.sleep(0.5)
-                self._ensure_message_submitted(input_handle, previous_messages, question)
+                self._ensure_message_submitted(input_handle, previous_messages, question, previous_user_messages)
                 return
         input_handle.press("Enter")
         time.sleep(0.5)
-        self._ensure_message_submitted(input_handle, previous_messages, question)
+        self._ensure_message_submitted(input_handle, previous_messages, question, previous_user_messages)
 
     def _wait_for_send_enabled(self, timeout: int = 5) -> bool:
         if self._page is None:
@@ -857,12 +911,13 @@ class DeepSeekWebClient:
         input_handle,
         previous_messages: Optional[list[str]] = None,
         question: str = "",
+        previous_user_messages: Optional[list[str]] = None,
         timeout: int = 5,
     ) -> None:
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._raise_if_cancelled()
-            if self._submission_observed(input_handle, previous_messages or [], question):
+            if self._submission_observed(input_handle, previous_messages or [], question, previous_user_messages or []):
                 return
             time.sleep(0.25)
         for key in ("Enter", "Control+Enter"):
@@ -872,26 +927,46 @@ class DeepSeekWebClient:
                 pass
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                if self._submission_observed(input_handle, previous_messages or [], question):
+                if self._submission_observed(input_handle, previous_messages or [], question, previous_user_messages or []):
                     return
                 time.sleep(0.25)
         raise RuntimeError("DeepSeek did not accept the message")
 
-    def _submission_observed(self, input_handle, previous_messages: list[str], question: str) -> bool:
+    def _submission_observed(
+        self,
+        input_handle,
+        previous_messages: list[str],
+        question: str,
+        previous_user_messages: list[str],
+    ) -> bool:
         if not self._get_input_text(input_handle):
             return True
-        messages = self._get_assistant_messages_texts()
-        if not messages:
-            return False
-        previous_count = len(previous_messages)
-        previous_answer = self._latest_assistant_message_text(previous_messages)
-        raw_text = self._latest_assistant_message_text(messages)
-        previous = "" if len(messages) > previous_count else previous_answer
-        text = self._sanitize_answer_text(raw_text, question, previous)
-        if text:
-            logging.info("DeepSeek submission confirmed by a new assistant answer while composer was still populated.")
+        if self._user_message_observed(previous_user_messages, question):
+            logging.info("DeepSeek submission confirmed by a new user message while composer was still populated.")
             return True
         return False
+
+    def _user_message_observed(self, previous_user_messages: list[str], question: str) -> bool:
+        user_messages = self._get_user_messages_texts()
+        if not user_messages:
+            return False
+        previous_count = len(previous_user_messages or [])
+        if len(user_messages) <= previous_count:
+            return False
+        latest = user_messages[-1]
+        return self._text_matches_prompt(latest, question)
+
+    @classmethod
+    def _text_matches_prompt(cls, actual: str, expected: str) -> bool:
+        got = (actual or "").strip().replace("\r\n", "\n")
+        wanted = (expected or "").strip().replace("\r\n", "\n")
+        if not got or not wanted:
+            return False
+        if cls._normalize_compare_text(got) == cls._normalize_compare_text(wanted):
+            return True
+        if len(wanted) <= 500:
+            return wanted in got or got in wanted
+        return wanted[:180] in got and wanted[-180:] in got
 
     @staticmethod
     def _get_input_text(input_handle) -> str:
@@ -1870,6 +1945,91 @@ class DeepSeekWebClient:
         """
         try:
             raw = self._page.evaluate(js, self.ASSISTANT_MESSAGE_SELECTORS)
+        except Exception:
+            return []
+        if not isinstance(raw, list):
+            return []
+        return [str(item or "").strip() for item in raw if str(item or "").strip()]
+
+    def _get_user_messages_texts(self) -> list[str]:
+        if self._page is None:
+            return []
+        js = """
+        (selectors) => {
+          const root = document.querySelector('main') || document.body;
+          const clean = (value) => (value || '')
+            .replace(/\\u00a0/g, ' ')
+            .replace(/[ \\t]+\\n/g, '\\n')
+            .replace(/\\n{3,}/g, '\\n\\n')
+            .trim();
+          const isVisible = (el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            return style.display !== 'none' && style.visibility !== 'hidden'
+              && rect.width > 0 && rect.height > 0;
+          };
+          const controlSelector = [
+            'button', '[role="button"]', 'svg', 'canvas', 'input', 'textarea',
+            'select', 'script', 'style', '[contenteditable="true"]',
+            '[aria-pressed]', '[aria-selected]', '[aria-checked]',
+            '[class*="toggle" i]', '[class*="ds-toggle-button" i]',
+            '[aria-label*="copy" i]', '[aria-label*="download" i]',
+            '[title*="copy" i]', '[title*="download" i]'
+          ].join(',');
+          const readText = (node) => {
+            const clone = node.cloneNode(true);
+            for (const control of clone.querySelectorAll(controlSelector)) control.remove();
+            const sandbox = document.createElement('div');
+            sandbox.style.cssText = 'position:fixed;left:-100000px;top:0;width:1200px;white-space:normal;';
+            sandbox.appendChild(clone);
+            document.body.appendChild(sandbox);
+            const value = clone.innerText || clone.textContent || '';
+            sandbox.remove();
+            return clean(value);
+          };
+          const candidateSelector = selectors.join(',');
+          const candidates = [];
+          for (const node of root.querySelectorAll(candidateSelector)) {
+            if (!node || !isVisible(node)) continue;
+            const text = readText(node);
+            if (!text) continue;
+            const hint = [
+              node.getAttribute && node.getAttribute('data-testid'),
+              node.getAttribute && node.getAttribute('data-role'),
+              node.getAttribute && node.getAttribute('class'),
+              node.getAttribute && node.getAttribute('aria-label'),
+            ].join(' ').toLowerCase();
+            const looksUser = /user|human|question|request|prompt|用户|человек|пользователь/.test(hint);
+            const looksAssistant = /assistant|bot|model|answer|response|markdown|prose|ассист|ответ/.test(hint);
+            if (looksAssistant && !looksUser) continue;
+            const rect = node.getBoundingClientRect();
+            candidates.push({node, text, top:rect.top || 0, bottom:rect.bottom || 0, userHint: looksUser});
+          }
+          const explicitUserCandidates = candidates.filter((item) => item.userHint);
+          const complete = explicitUserCandidates.filter((item) => !explicitUserCandidates.some((outer) =>
+            outer !== item
+            && outer.node !== item.node
+            && outer.node.contains(item.node)
+            && outer.text.length >= item.text.length
+          ));
+          complete.sort((a, b) => (a.bottom - b.bottom) || (a.top - b.top));
+          const output = [];
+          const seen = [];
+          for (const item of complete) {
+            const duplicate = seen.some((prev) =>
+              prev.text === item.text
+              && Math.abs(prev.top - item.top) < 3
+              && Math.abs(prev.bottom - item.bottom) < 3
+            );
+            if (duplicate) continue;
+            seen.push(item);
+            output.push(item.text);
+          }
+          return output;
+        }
+        """
+        try:
+            raw = self._page.evaluate(js, self.USER_MESSAGE_SELECTORS)
         except Exception:
             return []
         if not isinstance(raw, list):

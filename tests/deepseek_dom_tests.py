@@ -67,6 +67,26 @@ ACTIVE_HTML = """
 """
 
 
+USER_MESSAGE_HTML = """
+<!doctype html>
+<html>
+  <body>
+    <main>
+      <article data-testid="user-message">
+        <div>please create index.html</div>
+      </article>
+      <article data-testid="assistant-message">
+        <div class="markdown">I will create index.html.</div>
+      </article>
+      <article>
+        <div>generic article text should not confirm user submission</div>
+      </article>
+    </main>
+  </body>
+</html>
+"""
+
+
 UNLABELLED_REASONING_HTML = """
 <!doctype html>
 <html>
@@ -124,6 +144,10 @@ def main() -> None:
                 active_snapshot = client._get_answer_dom_snapshot()
                 assert_true(active_snapshot.get("reasoning_active"), "real busy status is still detected as active reasoning")
                 assert_true(active_snapshot.get("generation_active"), "busy status is detected as active generation")
+
+                page.set_content(USER_MESSAGE_HTML)
+                user_texts = client._get_user_messages_texts()
+                assert_true(user_texts == ["please create index.html"], "user message selector ignores assistant and generic article blocks")
             finally:
                 browser.close()
     print("deepseek_dom_tests: ok")

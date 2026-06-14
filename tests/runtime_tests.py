@@ -62,6 +62,32 @@ class StickyComposerClient(DeepSeekWebClient):
         return ["accepted answer"]
 
 
+class SubmittedUserMessageClient(StickyComposerClient):
+    def _get_user_messages_texts(self) -> list[str]:
+        return ["question"]
+
+
+class BusyBeforeSendClient(DeepSeekWebClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.index = 0
+        self._page = object()
+
+    def _get_answer_dom_snapshot(self) -> dict[str, bool]:
+        self.index += 1
+        if self.index <= 4:
+            return {
+                "generation_active": True,
+                "reasoning_active": False,
+                "web_search_active": False,
+            }
+        return {
+            "generation_active": False,
+            "reasoning_active": False,
+            "web_search_active": False,
+        }
+
+
 class FragmentedAnswerClient(DeepSeekWebClient):
     full_answer = (
         "FULL-ANSWER\n\n"
@@ -220,13 +246,25 @@ class LengthLimitRetryClient(DeepSeekWebClient):
     def _wait_for_input_ready(self, timeout: int = 60):
         return object()
 
+    def _wait_for_chat_idle_before_send(self, timeout: int = 60) -> None:
+        pass
+
     def _get_assistant_messages_texts(self) -> list[str]:
+        return []
+
+    def _get_user_messages_texts(self) -> list[str]:
         return []
 
     def _focus_and_fill_input(self, _input_handle, _text: str) -> None:
         pass
 
-    def _send_current_message(self, _input_handle, _previous_messages=None, _question: str = "") -> None:
+    def _send_current_message(
+        self,
+        _input_handle,
+        previous_messages=None,
+        question: str = "",
+        previous_user_messages=None,
+    ) -> None:
         self.sent_count += 1
 
     def _wait_for_new_answer(self, _previous_messages: list[str], _question: str, _timeout: int) -> str:
@@ -347,6 +385,13 @@ def main() -> None:
                 deepseek_runtime.DEBUG_ARTIFACT_DIR = original_debug_dir
         stale_new_chat = StaleNewChatClient()
         stale_new_chat._start_new_chat_locked()
+        idle_gate_clock = FakeClock()
+        deepseek_runtime.time.monotonic = idle_gate_clock.monotonic
+        deepseek_runtime.time.sleep = idle_gate_clock.sleep
+        busy_before_send = BusyBeforeSendClient()
+        busy_before_send._start_request_journal("runtime-busy-before-send", "question", 30, False)
+        busy_before_send._wait_for_chat_idle_before_send(timeout=5)
+        busy_before_send._finish_request_journal("ok")
     finally:
         deepseek_runtime.time.monotonic = original_monotonic
         deepseek_runtime.time.sleep = original_sleep
@@ -455,8 +500,14 @@ def main() -> None:
     assert stale_new_chat._page.button.click_count == 1
     assert stale_new_chat._page.goto_count == 1
     assert not stale_new_chat._page.limit_visible
+    assert busy_before_send.index == 5
+    busy_before_send_events = busy_before_send.last_request_journal["events"]
+    assert any(event["stage"] == "chat_busy_before_send" for event in busy_before_send_events)
+    assert any(event["stage"] == "chat_idle_before_send" for event in busy_before_send_events)
 
-    StickyComposerClient()._ensure_message_submitted(object(), [], "question", timeout=1)
+    sticky_composer = StickyComposerClient()
+    assert not sticky_composer._submission_observed(object(), [], "question", [])
+    assert SubmittedUserMessageClient()._submission_observed(object(), [], "question", [])
 
     class ClosedClient:
         def __init__(self) -> None:

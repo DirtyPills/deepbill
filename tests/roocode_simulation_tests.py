@@ -69,6 +69,37 @@ class RooSimulationWorker:
 
     def _answer(self, prompt: str) -> str:
         low = prompt.lower()
+        if "roo native write read marker" in low and "tool result (read_file" in low:
+            return "Native Roo write/read flow completed."
+        if "roo native write read marker" in low and "tool result (write_to_file" in low:
+            return '```tool_call\n{"name":"read_file","arguments":{"path":"native.html"}}\n```'
+        if "roo native write read marker" in low:
+            return (
+                '```tool_call\n{"name":"write_to_file","arguments":'
+                '{"path":"native.html","content":"<html><body><h1>Native Roo</h1></body></html>"}}\n```'
+            )
+
+        if "roo native terminal marker" in low and "tool result (execute_command" in low:
+            return "Native Roo terminal flow completed with green output."
+        if "roo native terminal marker" in low:
+            return '```tool_call\n{"name":"execute_command","arguments":{"command":"python calc.py"}}\n```'
+
+        if "roo large write marker" in low and "tool result (read_file" in low:
+            return "Large Roo file was written and read back successfully."
+        if "roo large write marker" in low and "tool result (write_to_file" in low:
+            return '```tool_call\n{"name":"read_file","arguments":{"path":"large.html"}}\n```'
+        if "roo large write marker" in low:
+            large_html = (
+                "<!doctype html>\n<html><body><main>\n"
+                + "\n".join(f"<section><h2>Block {idx}</h2><p>large-html-marker {idx}</p></section>" for idx in range(360))
+                + "\n</main></body></html>\n"
+            )
+            return "```tool_call\n" + json.dumps(
+                {"name": "write_to_file", "arguments": {"path": "large.html", "content": large_html}},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ) + "\n```"
+
         if "roo create read marker" in low and "tool result (read_file" in low:
             return "Verified: app.py was created and read successfully."
         if "roo create read marker" in low and "tool result (create_new_file" in low:
@@ -147,12 +178,24 @@ def tool_specs() -> list[dict[str, Any]]:
         {
             "type": "function",
             "function": {
+                "name": "write_to_file",
+                "description": "Write full content to a workspace file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
                 "name": "read_file",
                 "description": "Read a file from the workspace.",
                 "parameters": {
                     "type": "object",
-                    "properties": {"filepath": {"type": "string"}},
-                    "required": ["filepath"],
+                    "properties": {"filepath": {"type": "string"}, "path": {"type": "string"}},
+                    "required": ["path"],
                 },
             },
         },
@@ -165,6 +208,18 @@ def tool_specs() -> list[dict[str, Any]]:
                     "type": "object",
                     "properties": {"filepath": {"type": "string"}, "changes": {"type": "string"}},
                     "required": ["filepath", "changes"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "execute_command",
+                "description": "Execute a workspace terminal command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
                 },
             },
         },
@@ -191,18 +246,21 @@ def safe_path(workspace: Path, filepath: str) -> Path:
 
 
 def execute_tool(workspace: Path, name: str, args: dict[str, Any]) -> str:
-    if name == "create_new_file":
-        path = safe_path(workspace, str(args["filepath"]))
+    if name in {"create_new_file", "write_to_file"}:
+        filepath = str(args.get("filepath") or args.get("path"))
+        content = str(args.get("contents") if "contents" in args else args.get("content", ""))
+        path = safe_path(workspace, filepath)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(str(args.get("contents", "")), encoding="utf-8")
-        return f"created {args['filepath']} chars={path.stat().st_size}"
+        path.write_text(content, encoding="utf-8")
+        return f"created {filepath} chars={path.stat().st_size}"
     if name == "read_file":
-        return safe_path(workspace, str(args["filepath"])).read_text(encoding="utf-8")
+        filepath = str(args.get("filepath") or args.get("path"))
+        return safe_path(workspace, filepath).read_text(encoding="utf-8")
     if name == "edit_existing_file":
         path = safe_path(workspace, str(args["filepath"]))
         path.write_text(str(args.get("changes", "")), encoding="utf-8")
         return f"edited {args['filepath']} chars={path.stat().st_size}"
-    if name == "run_terminal_command":
+    if name in {"run_terminal_command", "execute_command"}:
         command = str(args.get("command", ""))
         if command != "python calc.py":
             raise ValueError(f"unexpected command: {command}")
@@ -263,6 +321,14 @@ def main() -> None:
             final, _messages = run_agent(
                 workspace,
                 "deepseek-chat",
+                "Roo native write read marker: создай native.html через write_to_file и прочитай его.",
+            )
+            assert_true("completed" in final.lower(), "native Roo write/read agent task finishes")
+            assert_true("Native Roo" in (workspace / "native.html").read_text(encoding="utf-8"), "native Roo write_to_file wrote real content")
+
+            final, _messages = run_agent(
+                workspace,
+                "deepseek-chat",
                 "Roo create read marker: создай app.py и прочитай его после создания.",
             )
             assert_true("verified" in final.lower(), "create/read agent task finishes")
@@ -293,6 +359,31 @@ def main() -> None:
             assert_true("green" in final.lower(), "edit/read/terminal agent task finishes")
             assert_true((workspace / "calc.py").read_text(encoding="utf-8").strip() == 'print("green")', "calc.py was edited for real")
             assert_true(any(call["use_reasoning"] for call in auto_calls), "auto mode used reasoning for complex Roo task")
+
+            final, _messages = run_agent(
+                workspace,
+                "deepseek-chat",
+                "Roo native terminal marker: запусти calc.py через execute_command.",
+            )
+            assert_true("terminal flow completed" in final.lower(), "native Roo execute_command agent task finishes")
+
+            final, _messages = run_agent(
+                workspace,
+                "deepseek-chat",
+                "Roo large write marker: создай большой HTML файл, затем прочитай его обратно.",
+                max_steps=6,
+            )
+            large_text = (workspace / "large.html").read_text(encoding="utf-8")
+            assert_true("large roo file" in final.lower(), "large write/read agent task finishes")
+            assert_true(len(large_text) > 20000 and "large-html-marker 359" in large_text, "large Roo file content is complete")
+
+            for index in range(5):
+                final, _messages = run_agent(
+                    workspace,
+                    "deepseek-chat",
+                    f"Roo native write read marker: serial request {index + 1}, создай и прочитай native.html.",
+                )
+                assert_true("completed" in final.lower(), f"serial Roo request {index + 1} finishes")
 
         status, deepthink = request_json(
             "/chat/completions",

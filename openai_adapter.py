@@ -393,6 +393,45 @@ class OpenAIAdapter:
         )
 
     @staticmethod
+    def _tool_call_repair_prompt(
+        original_prompt: str,
+        rejected_answer: str,
+        invalid_reasons: List[str],
+        tools: Any,
+    ) -> str:
+        tool_names: List[str] = []
+        required_by_tool: Dict[str, List[str]] = {}
+        if isinstance(tools, list):
+            for tool in tools:
+                if not isinstance(tool, dict) or tool.get("type") != "function":
+                    continue
+                func = tool.get("function", {})
+                if not isinstance(func, dict) or not func.get("name"):
+                    continue
+                name = str(func["name"])
+                tool_names.append(name)
+                params = func.get("parameters")
+                required = params.get("required") if isinstance(params, dict) else []
+                required_by_tool[name] = [str(item) for item in required or [] if isinstance(item, str)]
+
+        return (
+            f"{original_prompt}\n\n"
+            "The previous assistant response contained invalid tool_call JSON and was NOT sent to Roo Code.\n"
+            "Validation errors:\n"
+            + "\n".join(f"- {reason}" for reason in invalid_reasons[:12])
+            + "\n\n"
+            "Previous invalid response excerpt:\n"
+            f"{(rejected_answer or '').strip()[:5000]}\n\n"
+            "Return only corrected fenced tool_call block(s). Do not answer in prose.\n"
+            "Use exactly one of the available tool names and include every required argument inside the "
+            "`arguments` object, using the exact argument names from the schema. If the tool writes a file, "
+            "include the complete file content in the required content argument. If the tool edits a file, "
+            "include the complete edit/diff/changes payload required by the schema.\n"
+            f"Available tool names: {json.dumps(tool_names, ensure_ascii=False)}\n"
+            f"Required arguments by tool: {json.dumps(required_by_tool, ensure_ascii=False)}"
+        )
+
+    @staticmethod
     def _parse_json_maybe(value: str) -> Any:
         return parse_json_maybe(value)
 
@@ -453,18 +492,33 @@ class OpenAIAdapter:
             return ""
 
         specs: List[Dict[str, Any]] = []
+        example_calls: List[Dict[str, Any]] = []
         for tool in function_tools:
             func = tool.get("function", {})
             if not isinstance(func, dict) or not func.get("name"):
                 continue
+            parameters = func.get("parameters", {"type": "object", "properties": {}})
+            required = []
+            properties = {}
+            if isinstance(parameters, dict):
+                raw_required = parameters.get("required") or []
+                required = [str(item) for item in raw_required if isinstance(item, str)]
+                raw_properties = parameters.get("properties") or {}
+                properties = raw_properties if isinstance(raw_properties, dict) else {}
             specs.append(
                 {
                     "name": func.get("name"),
                     "description": func.get("description", ""),
-                    "parameters": func.get("parameters", {"type": "object", "properties": {}}),
+                    "parameters": parameters,
                     "strict": func.get("strict", False),
                 }
             )
+            if required:
+                example_args = {
+                    key: self._placeholder_for_tool_argument(str(func.get("name")), key, properties.get(key))
+                    for key in required[:8]
+                }
+                example_calls.append({"name": func.get("name"), "arguments": example_args})
         if not specs:
             return ""
 
@@ -478,22 +532,202 @@ class OpenAIAdapter:
             if name:
                 choice_note = f"Tool choice forces the tool named {name!r}."
 
+        examples_text = ""
+        if example_calls:
+            examples_text = (
+                "\nValid examples using the exact required argument names from the schemas:\n"
+                f"{json.dumps(example_calls[:8], ensure_ascii=False, indent=2)}\n"
+            )
+
         return (
             "You have access to application-side tools. Use them when needed for file, terminal, "
             "workspace, browser, or external actions.\n"
+            "This client uses native OpenAI/Roo Code tool calls through the adapter. The adapter will "
+            "convert your fenced tool_call block into native tool_calls. Roo Code rejects missing "
+            "native arguments.\n"
             "If a tool is needed, do not answer normally. Return only one or more fenced tool_call "
             "blocks, with valid JSON in each block:\n"
             "```tool_call\n"
             '{"name":"tool_name","arguments":{"arg":"value"}}\n'
             "```\n"
+            "Use exactly one of the tool names listed below. Put every tool parameter inside the "
+            "`arguments` object. Use the exact argument names from each tool schema, especially every "
+            "name listed in `required`; do not rename `path` to `filepath` or `content` to `contents` "
+            "unless the schema itself uses those names.\n"
+            "When writing or editing a file, include the full file content or full edit payload inside "
+            "the required JSON argument. Never put generated code outside the JSON object, never say "
+            "that you will call a tool, and never omit required arguments such as `path`, `content`, "
+            "`diff`, `changes`, or `command`.\n"
             "When an argument contains code, escape all JSON quotes and newlines; never paste the "
             "code outside the JSON object. Do not include UI words such as Copy or Download.\n"
             "The adapter will execute the tool and send the result back to you. After receiving tool "
             "results, continue the task or call another tool if needed.\n"
             f"{choice_note}\n"
+            f"{examples_text}"
             "Available tools JSON:\n"
             f"{json.dumps(specs, ensure_ascii=False, indent=2)}"
         ).strip()
+
+    @staticmethod
+    def _placeholder_for_tool_argument(tool_name: str, key: str, schema: Any = None) -> Any:
+        lower_key = key.lower()
+        lower_tool = (tool_name or "").lower()
+        if "path" in lower_key or lower_key in {"file", "filename"}:
+            return "relative/path.ext"
+        if lower_key in {"content", "contents", "text", "body"}:
+            return "<complete file content>" if "file" in lower_tool or "write" in lower_tool else "<content>"
+        if lower_key in {"diff", "patch", "changes"}:
+            return "<complete edit payload>"
+        if "command" in lower_key or lower_key == "cmd":
+            return "python -m pytest"
+        if isinstance(schema, dict):
+            schema_type = schema.get("type")
+            if schema_type == "integer":
+                return 0
+            if schema_type == "number":
+                return 0
+            if schema_type == "boolean":
+                return False
+            if schema_type == "array":
+                return []
+            if schema_type == "object":
+                return {}
+        return f"<{key}>"
+
+    @staticmethod
+    def _tool_specs_by_name(tools: Any) -> Dict[str, Dict[str, Any]]:
+        specs: Dict[str, Dict[str, Any]] = {}
+        if not isinstance(tools, list):
+            return specs
+        for tool in tools:
+            if not isinstance(tool, dict) or tool.get("type") != "function":
+                continue
+            func = tool.get("function", {})
+            if not isinstance(func, dict) or not func.get("name"):
+                continue
+            specs[str(func["name"])] = func
+        return specs
+
+    @staticmethod
+    def _required_tool_args(spec: Optional[Dict[str, Any]]) -> List[str]:
+        if not isinstance(spec, dict):
+            return []
+        params = spec.get("parameters")
+        if not isinstance(params, dict):
+            return []
+        required = params.get("required") or []
+        return [str(item) for item in required if isinstance(item, str)]
+
+    @staticmethod
+    def _tool_arg_properties(spec: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(spec, dict):
+            return {}
+        params = spec.get("parameters")
+        if not isinstance(params, dict):
+            return {}
+        properties = params.get("properties") or {}
+        return properties if isinstance(properties, dict) else {}
+
+    @staticmethod
+    def _argument_is_missing(value: Any) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str) and not value.strip():
+            return True
+        return False
+
+    @classmethod
+    def _normalize_tool_arguments_for_schema(cls, name: str, arguments: Any, spec: Optional[Dict[str, Any]]) -> Any:
+        if isinstance(arguments, str):
+            parsed = cls._parse_json_maybe(arguments)
+            arguments = parsed if isinstance(parsed, (dict, list)) else {"input": str(parsed)}
+        if not isinstance(arguments, dict):
+            return arguments
+
+        normalized = dict(arguments)
+        properties = cls._tool_arg_properties(spec)
+        required = set(cls._required_tool_args(spec))
+        relevant_keys = set(properties) | required
+        alias_groups = {
+            "path": ("filepath", "file_path", "filename", "file"),
+            "filepath": ("path", "file_path", "filename", "file"),
+            "content": ("contents", "file_content", "body", "text", "code", "html"),
+            "contents": ("content", "file_content", "body", "text", "code", "html"),
+            "changes": ("diff", "patch", "replacement", "content", "contents"),
+            "diff": ("changes", "patch", "replacement"),
+            "patch": ("diff", "changes"),
+            "command": ("cmd", "shell_command", "terminal_command"),
+            "cmd": ("command", "shell_command", "terminal_command"),
+        }
+        for key in relevant_keys:
+            if key in normalized and not cls._argument_is_missing(normalized.get(key)):
+                continue
+            for alias in alias_groups.get(key, ()):
+                if alias in normalized and not cls._argument_is_missing(normalized.get(alias)):
+                    normalized[key] = normalized[alias]
+                    break
+        return normalized
+
+    def _validate_raw_tool_call(
+        self,
+        raw_call: Any,
+        tools: Any,
+        *,
+        require_known_tool: bool,
+    ) -> Tuple[Optional[str], Any, Optional[str]]:
+        name = str(getattr(raw_call, "name", "") or "").strip()
+        if not name:
+            return None, None, "tool call has no name"
+
+        specs = self._tool_specs_by_name(tools)
+        spec = specs.get(name)
+        if require_known_tool and specs and spec is None:
+            return name, None, f"tool {name!r} is not in the request tool list"
+
+        arguments = self._normalize_tool_arguments_for_schema(name, getattr(raw_call, "arguments", {}), spec)
+        if spec is not None:
+            params = spec.get("parameters")
+            params_type = params.get("type") if isinstance(params, dict) else None
+            if params_type in {None, "object"} and not isinstance(arguments, dict):
+                return name, arguments, f"tool {name!r} arguments must be a JSON object"
+            if isinstance(arguments, dict):
+                missing = [
+                    key
+                    for key in self._required_tool_args(spec)
+                    if key not in arguments or self._argument_is_missing(arguments.get(key))
+                ]
+                if missing:
+                    received = ", ".join(sorted(arguments.keys())) or "none"
+                    return (
+                        name,
+                        arguments,
+                        f"tool {name!r} is missing required argument(s): {', '.join(missing)}; received keys: {received}",
+                    )
+        return name, arguments, None
+
+    def _raw_calls_to_tool_calls(
+        self,
+        raw_calls: List[Any],
+        *,
+        tools: Any = None,
+        require_known_tool: bool = False,
+    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        tool_calls: List[Dict[str, Any]] = []
+        invalid_reasons: List[str] = []
+        for raw_call in raw_calls:
+            name, arguments, error = self._validate_raw_tool_call(
+                raw_call,
+                tools,
+                require_known_tool=require_known_tool,
+            )
+            if error:
+                invalid_reasons.append(error)
+                continue
+            call = self._make_tool_call(str(name), arguments)
+            if call:
+                tool_calls.append(call)
+        deduped = self._dedupe_tool_calls(tool_calls) or []
+        return deduped, invalid_reasons
 
     # -------------------------------------------------------------- tool parser
     def _make_tool_call(self, name: str, arguments: Any) -> Optional[Dict[str, Any]]:
@@ -534,24 +768,48 @@ class OpenAIAdapter:
 
     def _extract_tool_calls(self, text: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         parsed = self._tool_parser.parse(text or "", allow_bare_json=True)
-        tool_calls = [call for raw_call in parsed.calls if (call := self._make_tool_call(raw_call.name, raw_call.arguments))]
+        tool_calls, _invalid_reasons = self._raw_calls_to_tool_calls(parsed.calls)
         return parsed.cleaned_text, self._dedupe_tool_calls(tool_calls)
 
     @staticmethod
     def _has_explicit_tool_marker(text: str) -> bool:
         return ToolCallParser.has_explicit_marker(text or "")
 
-    def _parse_assistant_answer(self, answer: str, allow_tool_calls: bool) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+    def _parse_assistant_answer_with_validation(
+        self,
+        answer: str,
+        allow_tool_calls: bool,
+        *,
+        tools: Any = None,
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]], List[str]]:
         if not allow_tool_calls and not self._tool_parser.has_explicit_marker(answer or ""):
-            return (answer or "").strip(), None
+            return (answer or "").strip(), None, []
         parsed = self._tool_parser.parse(answer or "", allow_bare_json=allow_tool_calls)
-        tool_calls = [call for raw_call in parsed.calls if (call := self._make_tool_call(raw_call.name, raw_call.arguments))]
-        tool_calls = self._dedupe_tool_calls(tool_calls)
+        tool_calls_list, invalid_reasons = self._raw_calls_to_tool_calls(
+            parsed.calls,
+            tools=tools,
+            require_known_tool=allow_tool_calls and bool(tools),
+        )
+        tool_calls = self._dedupe_tool_calls(tool_calls_list)
         if tool_calls:
-            return parsed.cleaned_text, tool_calls
+            return parsed.cleaned_text, tool_calls, invalid_reasons
         if allow_tool_calls:
-            return parsed.cleaned_text, None
-        return (answer or "").strip(), None
+            return parsed.cleaned_text, None, invalid_reasons
+        return (answer or "").strip(), None, invalid_reasons
+
+    def _parse_assistant_answer(
+        self,
+        answer: str,
+        allow_tool_calls: bool,
+        *,
+        tools: Any = None,
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
+        cleaned, tool_calls, _invalid_reasons = self._parse_assistant_answer_with_validation(
+            answer,
+            allow_tool_calls,
+            tools=tools,
+        )
+        return cleaned, tool_calls
 
     # -------------------------------------------------------------- prompt build
     def _has_history(self, messages: List[Dict[str, Any]]) -> bool:
@@ -1097,6 +1355,7 @@ class OpenAIAdapter:
         messages: List[Dict[str, Any]],
         use_reasoning: bool,
         request_id: str,
+        tools: Any = None,
     ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         if tool_calls:
             return cleaned, tool_calls
@@ -1123,6 +1382,7 @@ class OpenAIAdapter:
             repaired_cleaned, repaired_tool_calls = self._parse_assistant_answer(
                 repaired,
                 allow_tool_calls=has_tools,
+                tools=tools,
             )
             if repaired_tool_calls or (
                 repaired_cleaned and not self._looks_like_meta_reasoning_answer(repaired_cleaned)
@@ -1142,6 +1402,63 @@ class OpenAIAdapter:
         except Exception as exc:
             logger.warning("stage=repair_meta_answer_failed request_id=%s error=%s", request_id, exc)
         return cleaned, tool_calls
+
+    def _maybe_repair_invalid_tool_calls(
+        self,
+        answer: str,
+        cleaned: str,
+        tool_calls: Optional[List[Dict[str, Any]]],
+        invalid_reasons: List[str],
+        *,
+        has_tools: bool,
+        prompt: str,
+        timeout: int,
+        messages: List[Dict[str, Any]],
+        use_reasoning: bool,
+        request_id: str,
+        tools: Any = None,
+    ) -> Tuple[str, Optional[List[Dict[str, Any]]], List[str]]:
+        if not invalid_reasons:
+            return cleaned, tool_calls, invalid_reasons
+        if not has_tools:
+            return cleaned, tool_calls, invalid_reasons
+
+        repair_prompt = self._tool_call_repair_prompt(prompt, answer, invalid_reasons, tools)
+        repair_request_id = f"{request_id}-tool-repair"
+        logger.warning(
+            "stage=repair_invalid_tool_calls request_id=%s invalid=%s",
+            request_id,
+            "; ".join(invalid_reasons[:4]),
+        )
+        try:
+            repaired = self._ask_text(
+                repair_prompt,
+                timeout=timeout,
+                messages=messages,
+                use_reasoning=use_reasoning,
+                request_id=repair_request_id,
+            )
+            repaired_cleaned, repaired_tool_calls, repaired_invalid = self._parse_assistant_answer_with_validation(
+                repaired,
+                allow_tool_calls=has_tools,
+                tools=tools,
+            )
+            logger.info(
+                "stage=repair_invalid_tool_calls_done request_id=%s parsed_tool_calls=%s invalid_after=%s",
+                request_id,
+                len(repaired_tool_calls or []),
+                len(repaired_invalid or []),
+            )
+            if repaired_tool_calls and not repaired_invalid:
+                return repaired_cleaned, repaired_tool_calls, []
+            if repaired_tool_calls:
+                return repaired_cleaned, repaired_tool_calls, repaired_invalid
+            if repaired_cleaned and not self._looks_like_meta_reasoning_answer(repaired_cleaned):
+                return repaired_cleaned, None, repaired_invalid
+            return cleaned, tool_calls, repaired_invalid or invalid_reasons
+        except Exception as exc:
+            logger.warning("stage=repair_invalid_tool_calls_failed request_id=%s error=%s", request_id, exc)
+            return cleaned, tool_calls, invalid_reasons
 
     # --------------------------------------------------------------- responses
     @staticmethod
@@ -1317,7 +1634,24 @@ class OpenAIAdapter:
             )
             logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(answer), answer[:240])
             has_tools = bool(data.get("tools")) and data.get("tool_choice") != "none"
-            cleaned, tool_calls = self._parse_assistant_answer(answer, allow_tool_calls=has_tools)
+            cleaned, tool_calls, invalid_tool_calls = self._parse_assistant_answer_with_validation(
+                answer,
+                allow_tool_calls=has_tools,
+                tools=data.get("tools"),
+            )
+            cleaned, tool_calls, invalid_tool_calls = self._maybe_repair_invalid_tool_calls(
+                answer,
+                cleaned,
+                tool_calls,
+                invalid_tool_calls,
+                has_tools=has_tools,
+                prompt=prompt,
+                timeout=timeout,
+                messages=messages if isinstance(messages, list) else [],
+                use_reasoning=use_reasoning,
+                request_id=request_id,
+                tools=data.get("tools"),
+            )
             cleaned, tool_calls = self._maybe_repair_meta_answer(
                 cleaned,
                 tool_calls,
@@ -1327,12 +1661,14 @@ class OpenAIAdapter:
                 messages=messages if isinstance(messages, list) else [],
                 use_reasoning=use_reasoning,
                 request_id=request_id,
+                tools=data.get("tools"),
             )
             logger.info(
-                "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s cleaned_chars=%s",
+                "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s invalid_tool_calls=%s cleaned_chars=%s",
                 request_id,
                 has_tools,
                 len(tool_calls or []),
+                len(invalid_tool_calls or []),
                 len(cleaned or ""),
             )
             if not tool_calls:
@@ -1426,7 +1762,24 @@ class OpenAIAdapter:
                     request_id=request_id,
                 ).strip()
                 logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(collected), collected[:240])
-                cleaned, tool_calls = self._parse_assistant_answer(collected, allow_tool_calls=has_tools)
+                cleaned, tool_calls, invalid_tool_calls = self._parse_assistant_answer_with_validation(
+                    collected,
+                    allow_tool_calls=has_tools,
+                    tools=data.get("tools"),
+                )
+                cleaned, tool_calls, invalid_tool_calls = self._maybe_repair_invalid_tool_calls(
+                    collected,
+                    cleaned,
+                    tool_calls,
+                    invalid_tool_calls,
+                    has_tools=has_tools,
+                    prompt=prompt,
+                    timeout=timeout,
+                    messages=data.get("messages") if isinstance(data.get("messages"), list) else [],
+                    use_reasoning=use_reasoning,
+                    request_id=request_id,
+                    tools=data.get("tools"),
+                )
                 cleaned, tool_calls = self._maybe_repair_meta_answer(
                     cleaned,
                     tool_calls,
@@ -1436,12 +1789,14 @@ class OpenAIAdapter:
                     messages=data.get("messages") if isinstance(data.get("messages"), list) else [],
                     use_reasoning=use_reasoning,
                     request_id=request_id,
+                    tools=data.get("tools"),
                 )
                 logger.info(
-                    "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s cleaned_chars=%s",
+                    "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s invalid_tool_calls=%s cleaned_chars=%s",
                     request_id,
                     has_tools,
                     len(tool_calls or []),
+                    len(invalid_tool_calls or []),
                     len(cleaned or ""),
                 )
                 if tool_calls:
