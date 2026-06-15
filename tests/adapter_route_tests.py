@@ -208,7 +208,10 @@ class DiagnosticWorker:
         if "meta repair marker" in low and "previous assistant response was rejected" in low:
             return "Готово: файл прочитан и результат учтен."
         if "meta repair marker" in low and "tool result (read_file" in low:
-            return "We need to read the file after creating it. Then confirm."
+            return (
+                'Мы закончили все операции: создали файл и прочитали результат. '
+                'Теперь нужно ответить только коротким пользовательским результатом. Ответ: "Файл прочитан."'
+            )
         if "glued ui marker" in low:
             return (
                 "text Copy Downloadtool_call Copy Download "
@@ -234,7 +237,7 @@ class DiagnosticWorker:
             )
         if "invalid write file marker" in low:
             return 'tool_call {"name":"write_to_file","arguments":{"path":"index.html"}}'
-        if "tool result" in low or "created" in low:
+        if "tool result (" in low or "created" in low:
             return "Готово: результат инструмента учтен."
         if "content array marker" in low:
             return "Контент-массив принят."
@@ -548,7 +551,8 @@ def main() -> None:
     ]
     meta_message = meta_repair["choices"][0]["message"]
     assert_true(status == 200, "meta reasoning final repair returns HTTP 200")
-    assert_true("We need to" not in str(meta_message.get("content") or ""), "meta reasoning final is repaired")
+    assert_true("Теперь нужно" not in str(meta_message.get("content") or ""), "meta reasoning final is repaired")
+    assert_true("Готово: файл прочитан" in str(meta_message.get("content") or ""), "meta repair returns clean final answer")
     assert_true(len(meta_calls) == 2, "meta reasoning final triggers one repair request")
 
     adapter.circuit_failure_threshold = 2

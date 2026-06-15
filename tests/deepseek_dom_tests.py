@@ -87,6 +87,44 @@ USER_MESSAGE_HTML = """
 """
 
 
+SEND_BUTTON_HTML = """
+<!doctype html>
+<html>
+  <body>
+    <main>
+      <textarea placeholder="Message DeepSeek">hello</textarea>
+      <div role="button" class="ds-button ds-button--iconLabelPrimary ds-button--icon ds-button--capsule">
+        attach
+      </div>
+      <div role="button" class="ds-button ds-button--primary ds-button--filled ds-button--circle ds-button--disabled">
+        disabled send
+      </div>
+      <div id="send" role="button" class="ds-button ds-button--primary ds-button--filled ds-button--circle">
+        <svg></svg>
+      </div>
+    </main>
+  </body>
+</html>
+"""
+
+
+CONTINUE_BUTTON_HTML = """
+<!doctype html>
+<html>
+  <body>
+    <main>
+      <div id="continue" role="button">Continue</div>
+    </main>
+    <script>
+      document.getElementById("continue").addEventListener("click", () => {
+        document.body.setAttribute("data-continued", "yes");
+      });
+    </script>
+  </body>
+</html>
+"""
+
+
 UNLABELLED_REASONING_HTML = """
 <!doctype html>
 <html>
@@ -148,6 +186,17 @@ def main() -> None:
                 page.set_content(USER_MESSAGE_HTML)
                 user_texts = client._get_user_messages_texts()
                 assert_true(user_texts == ["please create index.html"], "user message selector ignores assistant and generic article blocks")
+
+                page.set_content(SEND_BUTTON_HTML)
+                input_handle = page.query_selector("textarea")
+                send_control, selector = client._find_send_control(input_handle)
+                assert_true(send_control is not None, "DeepSeek role-button send control is found")
+                assert_true(send_control.evaluate("el => el.id") == "send", "disabled send control is ignored")
+                assert_true("ds-button--primary" in selector or selector == "heuristic-near-input", "send selector path is reported")
+
+                page.set_content(CONTINUE_BUTTON_HTML)
+                assert_true(client._click_continue_if_available(), "Continue role-button is clicked on page")
+                assert_true(page.locator("body").get_attribute("data-continued") == "yes", "Continue click reaches the page handler")
             finally:
                 browser.close()
     print("deepseek_dom_tests: ok")

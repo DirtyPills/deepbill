@@ -67,6 +67,16 @@ class SubmittedUserMessageClient(StickyComposerClient):
         return ["question"]
 
 
+class StaleHandleFreshComposerClient(DeepSeekWebClient):
+    def _wait_for_input_ready(self, timeout: int = 60):
+        return "fresh-composer"
+
+    def _get_input_text_or_none(self, input_handle) -> str | None:
+        if input_handle == "fresh-composer":
+            return ""
+        return "prompt still stored on stale textarea handle"
+
+
 class BusyBeforeSendClient(DeepSeekWebClient):
     def __init__(self) -> None:
         super().__init__()
@@ -499,6 +509,7 @@ def main() -> None:
     sticky_composer = StickyComposerClient()
     assert not sticky_composer._submission_observed(object(), [], "question", [])
     assert SubmittedUserMessageClient()._submission_observed(object(), [], "question", [])
+    assert StaleHandleFreshComposerClient()._submission_observed("stale-composer", [], "question", [])
 
     class ClosedClient:
         def __init__(self) -> None:

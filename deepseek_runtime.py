@@ -173,8 +173,18 @@ class DeepSeekWebClient:
         "button[type='submit']",
         "button:has-text('Send')",
         "button:has-text('Отправить')",
+        "[role='button']:has-text('Send')",
+        "[role='button']:has-text('Отправить')",
         "button[aria-label*='Send']",
+        "button[aria-label*='Submit' i]",
         "button[aria-label*='Отправить']",
+        "[role='button'][aria-label*='Send' i]",
+        "[role='button'][aria-label*='Submit' i]",
+        "[role='button'][aria-label*='Отправить' i]",
+        "[role='button'][title*='Send' i]",
+        "[role='button'][title*='Submit' i]",
+        "[role='button'][title*='Отправить' i]",
+        "[role='button'][class*='ds-button--primary'][class*='ds-button--circle']:not([class*='disabled'])",
     ]
     ASSISTANT_MESSAGE_SELECTORS = [
         "[data-testid*='assistant']",
@@ -872,38 +882,171 @@ class DeepSeekWebClient:
     ) -> None:
         if self._page is None:
             raise RuntimeError("DeepSeek page is not initialized")
-        self._wait_for_send_enabled(timeout=5)
-        for selector in self.SEND_BUTTON_SELECTORS:
-            button = self._page.query_selector(selector)
-            if button is None:
-                continue
+        active_input = self._fresh_input_after_fill(input_handle, question)
+        self._wait_for_send_enabled(active_input, timeout=8)
+        button, selector = self._find_send_control(active_input)
+        if button is not None:
+            self._journal_event("submit_click", selector=selector)
+            button.click()
+            time.sleep(0.5)
+            self._ensure_message_submitted(active_input, previous_messages, question, previous_user_messages)
+            return
+
+        self._journal_event("submit_keyboard_fallback")
+        for key in ("Enter", "Control+Enter"):
+            active_input = self._fresh_input_after_fill(active_input, question)
             try:
-                ready = button.is_enabled() and button.is_visible()
+                active_input.click()
+                self._page.keyboard.press(key)
+            except Exception as exc:
+                self._journal_event("submit_keyboard_error", key=key, error=str(exc)[:240])
+                continue
+            time.sleep(0.5)
+            if self._submission_observed(active_input, previous_messages or [], question, previous_user_messages or []):
+                self._journal_event("submit_keyboard_accepted", key=key)
+                return
+        self._ensure_message_submitted(active_input, previous_messages, question, previous_user_messages)
+
+    def _fresh_input_after_fill(self, input_handle, expected: str):
+        if self._page is None:
+            raise RuntimeError("DeepSeek page is not initialized")
+        try:
+            if self._input_matches_text(input_handle, expected):
+                return input_handle
+        except Exception:
+            pass
+        try:
+            fresh = self._wait_for_input_ready(timeout=3)
+            if self._input_matches_text(fresh, expected):
+                self._journal_event("input_refreshed_before_submit")
+                return fresh
+        except Exception as exc:
+            self._journal_event("input_refresh_before_submit_failed", error=str(exc)[:240])
+        return input_handle
+
+    def _send_control_ready(self, element) -> bool:
+        try:
+            return bool(
+                element.evaluate(
+                    """
+                    (el) => {
+                      if (!el) return false;
+                      const style = window.getComputedStyle(el);
+                      const rect = el.getBoundingClientRect();
+                      const text = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                      const label = [
+                        el.getAttribute('aria-label'),
+                        el.getAttribute('title'),
+                        el.getAttribute('data-testid'),
+                        el.getAttribute('class')
+                      ].join(' ').toLowerCase();
+                      const disabled = Boolean(el.disabled)
+                        || el.getAttribute('aria-disabled') === 'true'
+                        || /\\bdisabled\\b|ds-button--disabled/.test(label);
+                      const blocked = /deepthink|reason|search|upload|attach|paperclip|image|file|mic|voice|new chat|новый чат|поиск|файл|изображ/.test(text + ' ' + label);
+                      return !disabled && !blocked
+                        && style.display !== 'none'
+                        && style.visibility !== 'hidden'
+                        && rect.width > 0
+                        && rect.height > 0;
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _find_send_control(self, input_handle=None):
+        if self._page is None:
+            return None, ""
+        for selector in self.SEND_BUTTON_SELECTORS:
+            try:
+                button = self._page.query_selector(selector)
+                if button is not None and self._send_control_ready(button):
+                    return button, selector
             except Exception:
                 continue
-            if ready:
-                button.click()
-                time.sleep(0.5)
-                self._ensure_message_submitted(input_handle, previous_messages, question, previous_user_messages)
-                return
-        input_handle.press("Enter")
-        time.sleep(0.5)
-        self._ensure_message_submitted(input_handle, previous_messages, question, previous_user_messages)
+        try:
+            handle = self._page.evaluate_handle(
+                """
+                (input) => {
+                  const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none'
+                      && style.visibility !== 'hidden'
+                      && rect.width > 0
+                      && rect.height > 0;
+                  };
+                  const clean = (value) => (value || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+                  const disabled = (el) => {
+                    const label = [
+                      el.getAttribute('aria-label'),
+                      el.getAttribute('title'),
+                      el.getAttribute('data-testid'),
+                      el.getAttribute('class')
+                    ].join(' ').toLowerCase();
+                    return Boolean(el.disabled)
+                      || el.getAttribute('aria-disabled') === 'true'
+                      || /\\bdisabled\\b|ds-button--disabled/.test(label);
+                  };
+                  const bad = /deepthink|reason|search|upload|attach|paperclip|image|file|mic|voice|new chat|новый чат|поиск|файл|изображ/;
+                  const sendish = /send|submit|arrow|отправ|发送|發送/;
+                  const inputRect = input && input.getBoundingClientRect ? input.getBoundingClientRect() : null;
+                  const controls = Array.from(document.querySelectorAll('button,[role="button"]'));
+                  const scored = [];
+                  for (const el of controls) {
+                    if (!visible(el) || disabled(el)) continue;
+                    const rect = el.getBoundingClientRect();
+                    const label = clean([
+                      el.innerText || el.textContent,
+                      el.getAttribute('aria-label'),
+                      el.getAttribute('title'),
+                      el.getAttribute('data-testid'),
+                      el.getAttribute('class')
+                    ].join(' '));
+                    if (bad.test(label)) continue;
+                    let score = 0;
+                    if (sendish.test(label)) score += 100;
+                    if (/ds-button--primary/.test(label)) score += 45;
+                    if (/ds-button--circle/.test(label)) score += 20;
+                    if (inputRect) {
+                      const nearY = rect.top >= inputRect.top - 80 && rect.bottom <= inputRect.bottom + 100;
+                      const rightSide = rect.left >= inputRect.left + inputRect.width * 0.5;
+                      const closeX = rect.left <= inputRect.right + 160 && rect.right >= inputRect.left;
+                      if (nearY) score += 35;
+                      if (rightSide) score += 20;
+                      if (closeX) score += 15;
+                    }
+                    if (rect.width <= 64 && rect.height <= 64) score += 8;
+                    if (score >= 55) scored.push({el, score, left: rect.left});
+                  }
+                  scored.sort((a, b) => (b.score - a.score) || (b.left - a.left));
+                  return scored.length ? scored[0].el : null;
+                }
+                """,
+                input_handle,
+            )
+            element = handle.as_element() if handle is not None else None
+            if element is not None and self._send_control_ready(element):
+                return element, "heuristic-near-input"
+        except Exception as exc:
+            self._journal_event("send_control_heuristic_failed", error=str(exc)[:240])
+        return None, ""
 
-    def _wait_for_send_enabled(self, timeout: int = 5) -> bool:
+    def _wait_for_send_enabled(self, input_handle=None, timeout: int = 5) -> bool:
         if self._page is None:
             return False
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             self._raise_if_cancelled()
-            for selector in self.SEND_BUTTON_SELECTORS:
-                try:
-                    button = self._page.query_selector(selector)
-                    if button is not None and button.is_visible() and button.is_enabled():
-                        return True
-                except Exception:
-                    continue
+            button, selector = self._find_send_control(input_handle)
+            if button is not None:
+                self._journal_event("send_control_ready", selector=selector)
+                return True
             time.sleep(0.25)
+        self._journal_event("send_control_not_found")
         return False
 
     def _ensure_message_submitted(
@@ -939,12 +1082,25 @@ class DeepSeekWebClient:
         question: str,
         previous_user_messages: list[str],
     ) -> bool:
-        if not self._get_input_text(input_handle):
+        composer_text = self._submission_input_text(input_handle)
+        if composer_text is not None and not composer_text:
+            self._journal_event("submit_confirmed_empty_composer")
             return True
         if self._user_message_observed(previous_user_messages, question):
             logging.info("DeepSeek submission confirmed by a new user message while composer was still populated.")
+            self._journal_event("submit_confirmed_user_message")
             return True
         return False
+
+    def _submission_input_text(self, input_handle) -> Optional[str]:
+        try:
+            fresh = self._wait_for_input_ready(timeout=1)
+            fresh_text = self._get_input_text_or_none(fresh)
+            if fresh_text is not None:
+                return fresh_text
+        except Exception:
+            pass
+        return self._get_input_text_or_none(input_handle)
 
     def _user_message_observed(self, previous_user_messages: list[str], question: str) -> bool:
         user_messages = self._get_user_messages_texts()
@@ -970,13 +1126,18 @@ class DeepSeekWebClient:
 
     @staticmethod
     def _get_input_text(input_handle) -> str:
+        value = DeepSeekWebClient._get_input_text_or_none(input_handle)
+        return value if value is not None else ""
+
+    @staticmethod
+    def _get_input_text_or_none(input_handle) -> Optional[str]:
         try:
             tag_name = input_handle.evaluate("el => el.tagName.toLowerCase()")
             if tag_name in {"textarea", "input"}:
                 return str(input_handle.input_value() or "").strip()
             return str(input_handle.evaluate("el => (el.innerText || el.textContent || '').trim()") or "").strip()
         except Exception:
-            return ""
+            return None
 
     def _wait_for_new_answer(self, previous_messages: list[str], question: str, timeout: int) -> str:
         deadline = time.monotonic() + timeout

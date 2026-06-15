@@ -354,6 +354,9 @@ class OpenAIAdapter:
             "i need to",
             "need to respond",
             "need to answer",
+            "the final answer should",
+            "the answer should",
+            "the answer will be",
             "the user said",
             "the user asks",
             "the user wants",
@@ -361,7 +364,17 @@ class OpenAIAdapter:
             "нужно ответить",
             "надо ответить",
             "теперь нужно",
+            "требуется ответить",
+            "требуется коротко",
             "мы получили результат",
+            "мы получили все результаты",
+            "мы получили",
+            "мы закончили",
+            "мы выполнили",
+            "все операции выполнены",
+            "после последнего чтения",
+            "ответ будет",
+            "финальный ответ",
             "по инструкции",
         )
         if normalized.startswith(strong_prefixes):
@@ -372,9 +385,20 @@ class OpenAIAdapter:
             "final answer",
             "respond to the user",
             "answer with only",
+            "answer will be",
             "no additional tool",
             "tool result",
             "tool call",
+            "now need",
+            "now we need",
+            "теперь нужно",
+            "нужно ответить",
+            "нужно подтвердить",
+            "получили результат",
+            "закончили все операции",
+            "ответ будет",
+            "ответ:",
+            "требуется коротко",
             "обычным текстом",
             "инструменты не нужны",
         )
@@ -956,7 +980,9 @@ class OpenAIAdapter:
         prompt_parts.append(
             "Answer as the assistant. Return only the final user-visible answer. Do not include analysis, "
             "reasoning, DeepThink text, hidden thoughts, or meta-commentary about how to answer. "
-            "If tool use is required, output only the requested tool_call block(s)."
+            "Never write phrases like 'we need to answer', 'we received the tool result', 'the answer will be', "
+            "'мы получили результат', 'мы закончили все операции', 'требуется ответить', 'теперь нужно', "
+            "'ответ будет', or 'ответ:'. If tool use is required, output only the requested tool_call block(s)."
         )
         return "\n\n".join(prompt_parts), latest_user
 
