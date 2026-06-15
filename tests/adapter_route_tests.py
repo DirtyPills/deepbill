@@ -220,20 +220,20 @@ class DiagnosticWorker:
                 'tool_call Copy Download [{"name":"create_new_file","arguments":{"filepath":"a.txt","contents":"A"}},'
                 '{"name":"edit_existing_file","arguments":{"filepath":"a.txt","changes":"AA"}}]'
             )
+        if "stream tool marker" in low:
+            return '```tool_call\n{"name":"read_file","arguments":{"filepath":"test.py"}}\n```'
         if "write alias marker" in low:
             return (
                 'tool_call Copy Download {"name":"write_to_file",'
-                '"arguments":{"filepath":"index.html","contents":"<html><body>alias ok</body></html>"}}'
+                '"arguments":{"filepath":"index.html","contents":"<h1>Alias OK</h1>"}}'
             )
         if "invalid write file marker" in low and "previous assistant response contained invalid tool_call" in low:
             return (
                 '```tool_call\n{"name":"write_to_file",'
-                '"arguments":{"path":"index.html","content":"<html><body>repaired full content</body></html>"}}\n```'
+                '"arguments":{"path":"index.html","content":"<h1>Fixed OK</h1>"}}\n```'
             )
         if "invalid write file marker" in low:
             return 'tool_call {"name":"write_to_file","arguments":{"path":"index.html"}}'
-        if "stream tool marker" in low:
-            return '```tool_call\n{"name":"read_file","arguments":{"filepath":"test.py"}}\n```'
         if "tool result" in low or "created" in low:
             return "Готово: результат инструмента учтен."
         if "content array marker" in low:
@@ -777,6 +777,59 @@ def main() -> None:
         "Python-literal tool name is preserved",
     )
 
+    roo_write_tool = [
+        {
+            "type": "function",
+            "function": {
+                "name": "write_to_file",
+                "description": "Write a file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
+                    "required": ["path", "content"],
+                },
+            },
+        }
+    ]
+    status, write_alias = request_json(
+        "/chat/completions",
+        {
+            "messages": [{"role": "user", "content": "write alias marker: создай index.html"}],
+            "tools": roo_write_tool,
+            "timeout": 30,
+        },
+    )
+    write_alias_choice = write_alias["choices"][0]
+    write_alias_call = write_alias_choice["message"]["tool_calls"][0]
+    write_alias_args = json.loads(write_alias_call["function"]["arguments"])
+    assert_true(status == 200, "Roo write alias request returns HTTP 200")
+    assert_true(write_alias_choice["finish_reason"] == "tool_calls", "Roo write alias returns tool_calls")
+    assert_true(write_alias_call["function"]["name"] == "write_to_file", "Roo write tool name is preserved")
+    assert_true(write_alias_args["path"] == "index.html", "Roo write filepath alias normalizes to path")
+    assert_true(write_alias_args["content"] == "<h1>Alias OK</h1>", "Roo write contents alias normalizes to content")
+
+    worker_prompt_count_before = len(worker.prompts)
+    status, invalid_write = request_json(
+        "/chat/completions",
+        {
+            "messages": [{"role": "user", "content": "invalid write file marker: создай index.html"}],
+            "tools": roo_write_tool,
+            "timeout": 30,
+        },
+    )
+    invalid_write_choice = invalid_write["choices"][0]
+    invalid_write_call = invalid_write_choice["message"]["tool_calls"][0]
+    invalid_write_args = json.loads(invalid_write_call["function"]["arguments"])
+    repair_prompts = worker.prompts[worker_prompt_count_before:]
+    assert_true(status == 200, "invalid Roo write request returns HTTP 200")
+    assert_true(invalid_write_choice["finish_reason"] == "tool_calls", "invalid Roo write is repaired into tool_calls")
+    assert_true(invalid_write_call["function"]["name"] == "write_to_file", "repaired Roo write tool name is preserved")
+    assert_true(invalid_write_args == {"path": "index.html", "content": "<h1>Fixed OK</h1>"}, "repaired Roo write has complete required args")
+    assert_true(
+        any("previous assistant response contained invalid tool_call" in prompt.lower() for prompt in repair_prompts),
+        "missing Roo write content triggers repair prompt before native tool_call",
+    )
+
     status, prose_no_tools = request_json(
         "/chat/completions",
         {
@@ -824,63 +877,6 @@ def main() -> None:
     assert_true(status == 200, "multi-tool array marker returns HTTP 200")
     assert_true(multi_choice["finish_reason"] == "tool_calls", "multi-tool array marker becomes tool_calls")
     assert_true(len(multi_choice["message"]["tool_calls"]) == 2, "multi-tool array returns two calls")
-
-    roo_write_tool = [
-        {
-            "type": "function",
-            "function": {
-                "name": "write_to_file",
-                "description": "Write full content to a workspace file.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "content": {"type": "string"},
-                    },
-                    "required": ["path", "content"],
-                },
-            },
-        }
-    ]
-    status, write_alias = request_json(
-        "/chat/completions",
-        {
-            "messages": [{"role": "user", "content": "write alias marker: создай index.html"}],
-            "tools": roo_write_tool,
-            "timeout": 30,
-        },
-    )
-    write_alias_choice = write_alias["choices"][0]
-    write_alias_call = write_alias_choice["message"]["tool_calls"][0]
-    write_alias_args = json.loads(write_alias_call["function"]["arguments"])
-    assert_true(status == 200, "Roo write alias marker returns HTTP 200")
-    assert_true(write_alias_choice["finish_reason"] == "tool_calls", "Roo write alias marker becomes native tool_calls")
-    assert_true(write_alias_call["function"]["name"] == "write_to_file", "Roo write tool name is preserved")
-    assert_true(write_alias_args["path"] == "index.html", "filepath alias is normalized to Roo path")
-    assert_true("alias ok" in write_alias_args["content"], "contents alias is normalized to Roo content")
-
-    calls_before_invalid_write = len(worker.calls)
-    status, invalid_write = request_json(
-        "/chat/completions",
-        {
-            "messages": [{"role": "user", "content": "invalid write file marker: создай index.html полностью"}],
-            "tools": roo_write_tool,
-            "timeout": 30,
-        },
-    )
-    invalid_write_calls = [
-        call for call in worker.calls[calls_before_invalid_write:]
-        if call["stage"] == "worker.ask_text"
-    ]
-    invalid_write_choice = invalid_write["choices"][0]
-    invalid_write_call = invalid_write_choice["message"]["tool_calls"][0]
-    invalid_write_args = json.loads(invalid_write_call["function"]["arguments"])
-    assert_true(status == 200, "invalid Roo write tool call is repaired with HTTP 200")
-    assert_true(invalid_write_choice["finish_reason"] == "tool_calls", "repaired Roo write response is a native tool_call")
-    assert_true(len(invalid_write_calls) == 2, "invalid Roo write call triggers one repair prompt")
-    assert_true(invalid_write_call["function"]["name"] == "write_to_file", "repaired Roo write tool name is preserved")
-    assert_true(invalid_write_args["path"] == "index.html", "repaired Roo write path is present")
-    assert_true("repaired full content" in invalid_write_args["content"], "repaired Roo write content is present")
 
     status, events = request_sse(
         "/chat/completions",

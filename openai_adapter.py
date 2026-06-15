@@ -557,7 +557,7 @@ class OpenAIAdapter:
             "When writing or editing a file, include the full file content or full edit payload inside "
             "the required JSON argument. Never put generated code outside the JSON object, never say "
             "that you will call a tool, and never omit required arguments such as `path`, `content`, "
-            "`diff`, `changes`, or `command`.\n"
+            "`line_count`, `diff`, `changes`, or `command`.\n"
             "When an argument contains code, escape all JSON quotes and newlines; never paste the "
             "code outside the JSON object. Do not include UI words such as Copy or Download.\n"
             "The adapter will execute the tool and send the result back to you. After receiving tool "
@@ -666,6 +666,13 @@ class OpenAIAdapter:
                 if alias in normalized and not cls._argument_is_missing(normalized.get(alias)):
                     normalized[key] = normalized[alias]
                     break
+        if (
+            "line_count" in relevant_keys
+            and cls._argument_is_missing(normalized.get("line_count"))
+            and not cls._argument_is_missing(normalized.get("content"))
+        ):
+            content_text = str(normalized.get("content") or "")
+            normalized["line_count"] = 0 if content_text == "" else content_text.count("\n") + 1
         return normalized
 
     def _validate_raw_tool_call(
@@ -769,7 +776,7 @@ class OpenAIAdapter:
     def _extract_tool_calls(self, text: str) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         parsed = self._tool_parser.parse(text or "", allow_bare_json=True)
         tool_calls, _invalid_reasons = self._raw_calls_to_tool_calls(parsed.calls)
-        return parsed.cleaned_text, self._dedupe_tool_calls(tool_calls)
+        return parsed.cleaned_text, tool_calls or None
 
     @staticmethod
     def _has_explicit_tool_marker(text: str) -> bool:
@@ -779,18 +786,17 @@ class OpenAIAdapter:
         self,
         answer: str,
         allow_tool_calls: bool,
-        *,
         tools: Any = None,
     ) -> Tuple[str, Optional[List[Dict[str, Any]]], List[str]]:
         if not allow_tool_calls and not self._tool_parser.has_explicit_marker(answer or ""):
             return (answer or "").strip(), None, []
         parsed = self._tool_parser.parse(answer or "", allow_bare_json=allow_tool_calls)
-        tool_calls_list, invalid_reasons = self._raw_calls_to_tool_calls(
+        require_known_tool = bool(tools) and allow_tool_calls
+        tool_calls, invalid_reasons = self._raw_calls_to_tool_calls(
             parsed.calls,
             tools=tools,
-            require_known_tool=allow_tool_calls and bool(tools),
+            require_known_tool=require_known_tool,
         )
-        tool_calls = self._dedupe_tool_calls(tool_calls_list)
         if tool_calls:
             return parsed.cleaned_text, tool_calls, invalid_reasons
         if allow_tool_calls:
@@ -801,12 +807,11 @@ class OpenAIAdapter:
         self,
         answer: str,
         allow_tool_calls: bool,
-        *,
         tools: Any = None,
     ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         cleaned, tool_calls, _invalid_reasons = self._parse_assistant_answer_with_validation(
             answer,
-            allow_tool_calls,
+            allow_tool_calls=allow_tool_calls,
             tools=tools,
         )
         return cleaned, tool_calls
@@ -1634,10 +1639,11 @@ class OpenAIAdapter:
             )
             logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(answer), answer[:240])
             has_tools = bool(data.get("tools")) and data.get("tool_choice") != "none"
+            tools = data.get("tools") or []
             cleaned, tool_calls, invalid_tool_calls = self._parse_assistant_answer_with_validation(
                 answer,
                 allow_tool_calls=has_tools,
-                tools=data.get("tools"),
+                tools=tools,
             )
             cleaned, tool_calls, invalid_tool_calls = self._maybe_repair_invalid_tool_calls(
                 answer,
@@ -1650,7 +1656,7 @@ class OpenAIAdapter:
                 messages=messages if isinstance(messages, list) else [],
                 use_reasoning=use_reasoning,
                 request_id=request_id,
-                tools=data.get("tools"),
+                tools=tools,
             )
             cleaned, tool_calls = self._maybe_repair_meta_answer(
                 cleaned,
@@ -1661,7 +1667,7 @@ class OpenAIAdapter:
                 messages=messages if isinstance(messages, list) else [],
                 use_reasoning=use_reasoning,
                 request_id=request_id,
-                tools=data.get("tools"),
+                tools=tools,
             )
             logger.info(
                 "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s invalid_tool_calls=%s cleaned_chars=%s",
@@ -1762,10 +1768,11 @@ class OpenAIAdapter:
                     request_id=request_id,
                 ).strip()
                 logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(collected), collected[:240])
+                tools = data.get("tools") or []
                 cleaned, tool_calls, invalid_tool_calls = self._parse_assistant_answer_with_validation(
                     collected,
                     allow_tool_calls=has_tools,
-                    tools=data.get("tools"),
+                    tools=tools,
                 )
                 cleaned, tool_calls, invalid_tool_calls = self._maybe_repair_invalid_tool_calls(
                     collected,
@@ -1778,7 +1785,7 @@ class OpenAIAdapter:
                     messages=data.get("messages") if isinstance(data.get("messages"), list) else [],
                     use_reasoning=use_reasoning,
                     request_id=request_id,
-                    tools=data.get("tools"),
+                    tools=tools,
                 )
                 cleaned, tool_calls = self._maybe_repair_meta_answer(
                     cleaned,
@@ -1789,7 +1796,7 @@ class OpenAIAdapter:
                     messages=data.get("messages") if isinstance(data.get("messages"), list) else [],
                     use_reasoning=use_reasoning,
                     request_id=request_id,
-                    tools=data.get("tools"),
+                    tools=tools,
                 )
                 logger.info(
                     "stage=parse_response request_id=%s has_tools=%s parsed_tool_calls=%s invalid_tool_calls=%s cleaned_chars=%s",
