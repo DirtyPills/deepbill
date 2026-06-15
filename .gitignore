@@ -12,3 +12,5 @@ deepbill_debug/
 !.env.example
 .DS_Store
 Thumbs.db
+.pytest_cache/
+PUSH/

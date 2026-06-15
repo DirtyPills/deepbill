@@ -11,6 +11,7 @@ Run after installation:
 .venv/bin/python tests/deepseek_dom_tests.py
 .venv/bin/python tests/adapter_route_tests.py
 .venv/bin/python tests/roocode_simulation_tests.py
+.venv/bin/python tests/roocode_heavy_simulation_tests.py
 ```
 
 `tests/adapter_route_tests.py` uses a deterministic worker and covers plain
@@ -21,6 +22,15 @@ read/edit/read content propagation.
 `tests/roocode_simulation_tests.py` runs a Roo Code-like loop with real local
 tool execution, including create/read, multiple tool calls in one assistant
 message, edit/read/terminal, and reasoning model routing.
+
+`tests/roocode_heavy_simulation_tests.py` covers longer Roo-style workflows:
+large project creation, invalid native tool repair, required argument autofill,
+`attempt_completion`, serial requests, large final responses, and streamed native
+tool calls.
+
+Queue/order regressions are covered in `tests/adapter_route_tests.py`: while one
+request is repairing an invalid tool call, a second request must wait and must not
+reach the browser worker until repair is complete.
 
 ## Live browser checks
 
@@ -54,3 +64,14 @@ captured Continue click because tail-marker compliance varies between replies.
 Use `--require-continuation` for that strict assertion; the default live run
 keeps going through the tool sandbox when DeepSeek declines every large request
 before exposing a Continue button.
+
+Before and after a live run, inspect:
+
+```bash
+curl http://127.0.0.1:8080/v1/health
+tail -n 80 logs/adapter_traffic.jsonl
+```
+
+There should be one ordered request chain at a time through the browser:
+`http.chat.received -> queue.acquired -> browser.request -> browser.response ->
+validating/repair if needed -> http.chat.completed -> queue.released`.

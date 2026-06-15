@@ -18,7 +18,8 @@ import threading
 import time
 import uuid
 from collections import deque
-from typing import Any, Deque, Dict, Iterable, Iterator, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Callable, Deque, Dict, Iterable, Iterator, List, Optional, Tuple
 
 from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_cors import CORS
@@ -47,10 +48,14 @@ REASONING_CONTEXT_SOFT_LIMIT = int(os.environ.get("DEEPBILL_REASONING_CONTEXT_SO
 MAX_CONTEXT_BUFFER_CHARS = int(os.environ.get("DEEPBILL_ADAPTER_BUFFER_CHARS", "12000"))
 STREAM_TEXT_CHARS = int(os.environ.get("DEEPBILL_ADAPTER_STREAM_CHARS", "140"))
 DEEPSEEK_RETRY_ATTEMPTS = max(0, int(os.environ.get("DEEPBILL_ADAPTER_RETRIES", "1")))
-BROWSER_BUSY_TIMEOUT_SEC = float(os.environ.get("DEEPBILL_ADAPTER_BUSY_TIMEOUT", "5"))
-ADAPTER_QUEUE_LIMIT = max(0, int(os.environ.get("DEEPBILL_ADAPTER_QUEUE_LIMIT", "1")))
+BROWSER_BUSY_TIMEOUT_SEC = float(os.environ.get("DEEPBILL_ADAPTER_BUSY_TIMEOUT", str(MAX_REQUEST_TIMEOUT_SEC)))
+ADAPTER_QUEUE_LIMIT = max(0, int(os.environ.get("DEEPBILL_ADAPTER_QUEUE_LIMIT", "16")))
 ADAPTER_CIRCUIT_FAILURE_THRESHOLD = max(0, int(os.environ.get("DEEPBILL_ADAPTER_CIRCUIT_FAILURE_THRESHOLD", "3")))
 ADAPTER_CIRCUIT_COOLDOWN_SEC = max(1.0, float(os.environ.get("DEEPBILL_ADAPTER_CIRCUIT_COOLDOWN_SEC", "60")))
+TRAFFIC_LOG_DIR = os.environ.get("DEEPBILL_TRAFFIC_LOG_DIR", "logs")
+TRAFFIC_LOG_FILE = os.environ.get("DEEPBILL_TRAFFIC_LOG_FILE", "adapter_traffic.jsonl")
+TRAFFIC_LOG_DETAILED = os.environ.get("DEEPBILL_TRAFFIC_LOG_DETAILED", "0") != "0"
+TRAFFIC_HISTORY_LIMIT = max(10, int(os.environ.get("DEEPBILL_TRAFFIC_HISTORY_LIMIT", "300")))
 REASONING_FORCE_MODEL_FRAGMENTS = (
     "deepthink",
     "reasoner",
@@ -97,8 +102,128 @@ class AdapterCircuitOpenError(RuntimeError):
         self.retry_after = max(1.0, float(retry_after or 1.0))
 
 
+class AdapterTrafficJournal:
+    """Append-only adapter traffic journal with compact GUI events.
+
+    Basic records are always written. Full request/response payloads are only
+    written when detailed logging is enabled because they can be very large.
+    """
+
+    def __init__(
+        self,
+        log_dir: str = TRAFFIC_LOG_DIR,
+        log_file: str = TRAFFIC_LOG_FILE,
+        detailed: bool = TRAFFIC_LOG_DETAILED,
+        event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ):
+        self.path = Path(log_dir).expanduser().resolve() / log_file
+        self.detailed = bool(detailed)
+        self.event_sink = event_sink
+        self._lock = threading.Lock()
+        self._history: Deque[Dict[str, Any]] = deque(maxlen=TRAFFIC_HISTORY_LIMIT)
+
+    def set_detailed(self, enabled: bool) -> None:
+        self.detailed = bool(enabled)
+        self.event(
+            "traffic_log.mode",
+            level="info",
+            summary=f"detailed={'on' if self.detailed else 'off'}",
+            data={"detailed": self.detailed, "path": str(self.path)},
+        )
+
+    def set_event_sink(self, event_sink: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        self.event_sink = event_sink
+
+    def diagnostics(self) -> Dict[str, Any]:
+        return {
+            "path": str(self.path),
+            "detailed": self.detailed,
+            "tail": list(self._history)[-20:],
+        }
+
+    def event(
+        self,
+        stage: str,
+        *,
+        request_id: str = "",
+        level: str = "info",
+        summary: str = "",
+        data: Optional[Dict[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        now = time.time()
+        record: Dict[str, Any] = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
+            "epoch": round(now, 3),
+            "thread": threading.current_thread().name,
+            "level": level,
+            "stage": stage,
+            "request_id": request_id,
+            "summary": summary,
+            "data": self._safe_json(data or {}, detailed=False),
+        }
+        if self.detailed and details:
+            record["details"] = self._safe_json(details, detailed=True)
+
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            with self._lock:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+                self._history.append(self._compact_record(record))
+        except Exception as exc:
+            logger.warning("stage=traffic_log_write_failed error=%s", exc)
+
+        sink = self.event_sink
+        if sink is not None:
+            try:
+                sink(self._compact_record(record))
+            except Exception as exc:
+                logger.debug("Adapter traffic event sink failed: %s", exc)
+
+    @classmethod
+    def _safe_json(cls, value: Any, *, detailed: bool) -> Any:
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            if detailed:
+                return value
+            return value if len(value) <= 1200 else value[:1200] + f"...<truncated {len(value) - 1200} chars>"
+        if isinstance(value, bytes):
+            text = value.decode("utf-8", errors="replace")
+            return cls._safe_json(text, detailed=detailed)
+        if isinstance(value, dict):
+            return {str(key): cls._safe_json(item, detailed=detailed) for key, item in value.items()}
+        if isinstance(value, (list, tuple, deque)):
+            items = list(value)
+            if not detailed and len(items) > 40:
+                items = items[:40] + [f"...<truncated {len(value) - 40} items>"]
+            return [cls._safe_json(item, detailed=detailed) for item in items]
+        return cls._safe_json(str(value), detailed=detailed)
+
+    @staticmethod
+    def _compact_record(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "ts": record.get("ts", ""),
+            "level": record.get("level", ""),
+            "stage": record.get("stage", ""),
+            "request_id": record.get("request_id", ""),
+            "summary": record.get("summary", ""),
+            "data": record.get("data", {}),
+        }
+
+
 class OpenAIAdapter:
-    def __init__(self, browser_worker: Optional[Any] = None, port: int = 8080):
+    def __init__(
+        self,
+        browser_worker: Optional[Any] = None,
+        port: int = 8080,
+        *,
+        detailed_logging: Optional[bool] = None,
+        event_sink: Optional[Callable[[Dict[str, Any]], None]] = None,
+        traffic_journal: Optional[AdapterTrafficJournal] = None,
+    ):
         self.browser_worker = browser_worker
         self.port = port
         self.app = Flask(__name__)
@@ -112,6 +237,9 @@ class OpenAIAdapter:
         self._state_lock = threading.Lock()
         self._browser_request_lock = threading.Lock()
         self._admission_lock = threading.Lock()
+        self._request_local = threading.local()
+        self._request_states: Dict[str, Dict[str, Any]] = {}
+        self._request_state_history: Deque[Dict[str, Any]] = deque(maxlen=TRAFFIC_HISTORY_LIMIT)
         self.queue_limit = ADAPTER_QUEUE_LIMIT
         self.circuit_failure_threshold = ADAPTER_CIRCUIT_FAILURE_THRESHOLD
         self.circuit_cooldown_sec = ADAPTER_CIRCUIT_COOLDOWN_SEC
@@ -138,10 +266,73 @@ class OpenAIAdapter:
         self.context_buffer_enabled = os.environ.get("DEEPBILL_ADAPTER_CONTEXT_BUFFER", "1") != "0"
         self.single_message_new_chat = os.environ.get("DEEPBILL_ADAPTER_SINGLE_MESSAGE_NEW_CHAT", "1") != "0"
         self._tool_parser = ToolCallParser()
+        if traffic_journal is None:
+            traffic_journal = AdapterTrafficJournal(
+                detailed=TRAFFIC_LOG_DETAILED if detailed_logging is None else bool(detailed_logging),
+                event_sink=event_sink,
+            )
+        else:
+            traffic_journal.set_event_sink(event_sink)
+            if detailed_logging is not None:
+                traffic_journal.set_detailed(bool(detailed_logging))
+        self.traffic_journal = traffic_journal
         self._register_routes()
         self._server_thread: Optional[threading.Thread] = None
         self._http_server: Optional[Any] = None
         self._running = False
+
+    def set_detailed_logging(self, enabled: bool) -> None:
+        self.traffic_journal.set_detailed(bool(enabled))
+
+    def set_event_sink(self, event_sink: Optional[Callable[[Dict[str, Any]], None]]) -> None:
+        self.traffic_journal.set_event_sink(event_sink)
+
+    def get_traffic_log_path(self) -> str:
+        return str(self.traffic_journal.path)
+
+    def _traffic_event(
+        self,
+        stage: str,
+        *,
+        request_id: str = "",
+        level: str = "info",
+        summary: str = "",
+        data: Optional[Dict[str, Any]] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.traffic_journal.event(
+            stage,
+            request_id=request_id,
+            level=level,
+            summary=summary,
+            data=data,
+            details=details,
+        )
+
+    def _set_request_state(self, request_id: str, state: str, **data: Any) -> None:
+        if not request_id:
+            return
+        now = time.time()
+        with self._admission_lock:
+            item = self._request_states.setdefault(
+                request_id,
+                {"request_id": request_id, "created_at": now, "history": []},
+            )
+            item.update({"state": state, "updated_at": now, **data})
+            item["history"].append({"state": state, "at": round(now, 3), **data})
+            snapshot = {
+                "request_id": request_id,
+                "state": state,
+                "updated_at": round(now, 3),
+                **data,
+            }
+            self._request_state_history.append(snapshot)
+        self._traffic_event(
+            "request.state",
+            request_id=request_id,
+            summary=state,
+            data={"state": state, **data},
+        )
 
     # ------------------------------------------------------------------ routes
     def _register_routes(self) -> None:
@@ -215,13 +406,17 @@ class OpenAIAdapter:
                     diagnostics = payload.setdefault("diagnostics", {})
                     if isinstance(diagnostics, dict):
                         diagnostics["adapter"] = self._adapter_diagnostics()
+                        diagnostics["traffic_log"] = self.traffic_journal.diagnostics()
                     return payload
                 except Exception as exc:
                     return {"status": "error", "ready": False, "error": str(exc)}, 503
             return {
                 "status": "ok" if ready else "error",
                 "ready": ready,
-                "diagnostics": {"adapter": self._adapter_diagnostics()},
+                "diagnostics": {
+                    "adapter": self._adapter_diagnostics(),
+                    "traffic_log": self.traffic_journal.diagnostics(),
+                },
             }
 
         @self.app.route("/test", methods=["GET"])
@@ -292,6 +487,12 @@ class OpenAIAdapter:
                 "circuit_open_count": self._circuit_open_count,
                 "last_circuit_error": self._last_circuit_error,
                 "last_circuit_opened_at": round(self._last_circuit_opened_at, 3),
+                "request_state_tail": list(self._request_state_history)[-20:],
+                "active_request_state": (
+                    dict(self._request_states.get(self._active_adapter_request_id, {}))
+                    if self._active_adapter_request_id
+                    else {}
+                ),
             }
 
     @staticmethod
@@ -354,6 +555,8 @@ class OpenAIAdapter:
             "i need to",
             "need to respond",
             "need to answer",
+            "answer as the assistant",
+            "return only the final user-visible answer",
             "the final answer should",
             "the answer should",
             "the answer will be",
@@ -383,6 +586,7 @@ class OpenAIAdapter:
             "so just output",
             "just output",
             "final answer",
+            "user-visible answer",
             "respond to the user",
             "answer with only",
             "answer will be",
@@ -413,7 +617,8 @@ class OpenAIAdapter:
             f"{rejected_answer.strip()[:2000]}\n\n"
             "Use the conversation and tool results above. If another tool is genuinely required, return only "
             "the tool_call block. Otherwise return only the concise final user-visible answer. Do not mention "
-            "what you need to do, hidden reasoning, or these repair instructions."
+            "what you need to do, hidden reasoning, or these repair instructions. User-visible prose must be "
+            "in Russian unless the user explicitly asks for another language."
         )
 
     @staticmethod
@@ -824,6 +1029,10 @@ class OpenAIAdapter:
         if tool_calls:
             return parsed.cleaned_text, tool_calls, invalid_reasons
         if allow_tool_calls:
+            if parsed.explicit_marker and not invalid_reasons:
+                invalid_reasons.append("explicit tool_call marker did not contain a complete valid tool call")
+            if parsed.explicit_marker and parsed.cleaned_text and self._looks_like_meta_reasoning_answer(parsed.cleaned_text):
+                invalid_reasons.append("explicit tool_call marker was mixed with hidden/meta reasoning text")
             return parsed.cleaned_text, None, invalid_reasons
         return (answer or "").strip(), None, invalid_reasons
 
@@ -980,6 +1189,7 @@ class OpenAIAdapter:
         prompt_parts.append(
             "Answer as the assistant. Return only the final user-visible answer. Do not include analysis, "
             "reasoning, DeepThink text, hidden thoughts, or meta-commentary about how to answer. "
+            "Write user-visible prose only in Russian unless the user explicitly asks for another language. "
             "Never write phrases like 'we need to answer', 'we received the tool result', 'the answer will be', "
             "'мы получили результат', 'мы закончили все операции', 'требуется ответить', 'теперь нужно', "
             "'ответ будет', or 'ответ:'. If tool use is required, output only the requested tool_call block(s)."
@@ -1095,6 +1305,17 @@ class OpenAIAdapter:
         self._accepted_requests += 1
 
     def _acquire_browser_request(self, request_id: Optional[str] = None) -> None:
+        depth = int(getattr(self._request_local, "browser_lock_depth", 0) or 0)
+        if depth > 0:
+            self._request_local.browser_lock_depth = depth + 1
+            self._traffic_event(
+                "queue.reentrant",
+                request_id=str(request_id or ""),
+                summary=f"depth={depth + 1}",
+                data={"depth": depth + 1},
+            )
+            return
+
         timeout = max(0.0, BROWSER_BUSY_TIMEOUT_SEC)
         with self._admission_lock:
             self._raise_if_circuit_open_locked()
@@ -1108,6 +1329,13 @@ class OpenAIAdapter:
                     self._browser_request_lock.release()
                     raise
                 self._mark_request_active_locked(request_id)
+            self._request_local.browser_lock_depth = 1
+            self._traffic_event(
+                "queue.acquired",
+                request_id=str(request_id or ""),
+                summary="acquired immediately",
+                data={"waiting": 0, "queue_limit": self.queue_limit},
+            )
             return
 
         with self._admission_lock:
@@ -1125,6 +1353,19 @@ class OpenAIAdapter:
                     f"queue_limit={self.queue_limit})"
                 )
             self._waiting_browser_requests += 1
+            waiting_now = self._waiting_browser_requests
+
+        self._traffic_event(
+            "queue.wait",
+            request_id=str(request_id or ""),
+            summary=f"waiting active={self._active_adapter_request_id or 'unknown'}",
+            data={
+                "waiting": waiting_now,
+                "queue_limit": self.queue_limit,
+                "active_request_id": self._active_adapter_request_id,
+                "timeout_sec": timeout,
+            },
+        )
 
         try:
             if timeout:
@@ -1138,6 +1379,13 @@ class OpenAIAdapter:
         if not acquired:
             with self._admission_lock:
                 self._rejected_busy_timeout += 1
+            self._traffic_event(
+                "queue.timeout",
+                request_id=str(request_id or ""),
+                level="warning",
+                summary=f"busy for more than {timeout:g}s",
+                data={"timeout_sec": timeout},
+            )
             raise BrowserBusyError(
                 f"DeepSeek browser is busy with another request for more than {timeout:g} seconds"
             )
@@ -1148,12 +1396,36 @@ class OpenAIAdapter:
                 self._browser_request_lock.release()
                 raise
             self._mark_request_active_locked(request_id)
+        self._request_local.browser_lock_depth = 1
+        self._traffic_event(
+            "queue.acquired",
+            request_id=str(request_id or ""),
+            summary="acquired after wait",
+            data={"queue_limit": self.queue_limit},
+        )
 
     def _release_browser_request(self) -> None:
+        depth = int(getattr(self._request_local, "browser_lock_depth", 0) or 0)
+        if depth > 1:
+            self._request_local.browser_lock_depth = depth - 1
+            self._traffic_event(
+                "queue.reentrant_release",
+                request_id=str(getattr(self._request_local, "request_id", "") or ""),
+                summary=f"depth={depth - 1}",
+                data={"depth": depth - 1},
+            )
+            return
+        self._request_local.browser_lock_depth = 0
         with self._admission_lock:
+            request_id = self._active_adapter_request_id
             self._active_adapter_request_id = ""
             self._active_adapter_since = None
         self._browser_request_lock.release()
+        self._traffic_event(
+            "queue.released",
+            request_id=request_id,
+            summary="released",
+        )
 
     def _record_adapter_success(self) -> None:
         with self._admission_lock:
@@ -1175,6 +1447,15 @@ class OpenAIAdapter:
                 self._circuit_open_until = time.monotonic() + self.circuit_cooldown_sec
                 self._circuit_open_count += 1
                 self._last_circuit_opened_at = time.time()
+                self._traffic_event(
+                    "adapter.circuit_open",
+                    level="warning",
+                    summary=str(exc),
+                    data={
+                        "failures": self._circuit_failures,
+                        "cooldown_sec": self.circuit_cooldown_sec,
+                    },
+                )
                 logger.warning(
                     "stage=adapter_circuit_open failures=%s cooldown=%ss error=%s",
                     self._circuit_failures,
@@ -1220,9 +1501,22 @@ class OpenAIAdapter:
             return False
         try:
             worker.new_chat(timeout=30)
+            self._traffic_event(
+                "browser.new_chat",
+                request_id=str(getattr(self._request_local, "request_id", "") or ""),
+                summary=reason,
+                data={"reason": reason},
+            )
             logger.info("stage=deepseek_new_chat reason=%s", reason)
             return True
         except Exception as exc:
+            self._traffic_event(
+                "browser.new_chat_failed",
+                request_id=str(getattr(self._request_local, "request_id", "") or ""),
+                level="warning",
+                summary=str(exc),
+                data={"reason": reason, "error": str(exc)},
+            )
             logger.warning("stage=deepseek_new_chat_failed reason=%s error=%s", reason, exc)
             return False
 
@@ -1300,7 +1594,30 @@ class OpenAIAdapter:
             last_error: Optional[Exception] = None
             for attempt in range(1, attempts + 1):
                 try:
+                    self._traffic_event(
+                        "browser.request",
+                        request_id=str(request_id or ""),
+                        summary=f"sync attempt={attempt}/{attempts}",
+                        data={
+                            "attempt": attempt,
+                            "attempts": attempts,
+                            "timeout": timeout,
+                            "use_reasoning": bool(use_reasoning),
+                            "prompt_chars": len(prompt or ""),
+                        },
+                        details={"prompt": prompt},
+                    )
                     answer = self._worker_ask_text(worker, prompt, timeout, use_reasoning, request_id=request_id)
+                    self._traffic_event(
+                        "browser.response",
+                        request_id=str(request_id or ""),
+                        summary=f"answer_chars={len(answer or '')}",
+                        data={"answer_chars": len(answer or ""), "attempt": attempt},
+                        details={
+                            "answer": answer,
+                            "worker_diagnostics": self._worker_diagnostics_snapshot(worker),
+                        },
+                    )
                     self._record_adapter_success()
                     return answer
                 except Exception as exc:
@@ -1309,6 +1626,13 @@ class OpenAIAdapter:
                     last_error = exc
                     if attempt >= attempts or not self._is_retryable_deepseek_error(exc):
                         raise
+                    self._traffic_event(
+                        "browser.retry",
+                        request_id=str(request_id or ""),
+                        level="warning",
+                        summary=str(exc),
+                        data={"next_attempt": attempt + 1, "attempts": attempts, "error": str(exc)},
+                    )
                     logger.warning(
                         "stage=deepseek_retry mode=sync attempt=%s/%s error=%s",
                         attempt + 1,
@@ -1340,6 +1664,19 @@ class OpenAIAdapter:
             attempts = DEEPSEEK_RETRY_ATTEMPTS + 1
             for attempt in range(1, attempts + 1):
                 try:
+                    self._traffic_event(
+                        "browser.request",
+                        request_id=str(request_id or ""),
+                        summary=f"stream attempt={attempt}/{attempts}",
+                        data={
+                            "attempt": attempt,
+                            "attempts": attempts,
+                            "timeout": timeout,
+                            "use_reasoning": bool(use_reasoning),
+                            "prompt_chars": len(prompt or ""),
+                        },
+                        details={"prompt": prompt},
+                    )
                     if hasattr(worker, "ask_text_stream"):
                         yield from self._worker_ask_text_stream(
                             worker,
@@ -1351,6 +1688,16 @@ class OpenAIAdapter:
                         self._record_adapter_success()
                         return
                     answer = self._worker_ask_text(worker, prompt, timeout, use_reasoning, request_id=request_id)
+                    self._traffic_event(
+                        "browser.response",
+                        request_id=str(request_id or ""),
+                        summary=f"answer_chars={len(answer or '')}",
+                        data={"answer_chars": len(answer or ""), "attempt": attempt},
+                        details={
+                            "answer": answer,
+                            "worker_diagnostics": self._worker_diagnostics_snapshot(worker),
+                        },
+                    )
                     for chunk in self._split_text(answer):
                         yield chunk
                     self._record_adapter_success()
@@ -1360,6 +1707,13 @@ class OpenAIAdapter:
                         raise BrowserBusyError(str(exc)) from exc
                     if attempt >= attempts or not self._is_retryable_deepseek_error(exc):
                         raise
+                    self._traffic_event(
+                        "browser.retry",
+                        request_id=str(request_id or ""),
+                        level="warning",
+                        summary=str(exc),
+                        data={"next_attempt": attempt + 1, "attempts": attempts, "error": str(exc)},
+                    )
                     logger.warning(
                         "stage=deepseek_retry mode=stream attempt=%s/%s error=%s",
                         attempt + 1,
@@ -1374,6 +1728,17 @@ class OpenAIAdapter:
             raise
         finally:
             self._release_browser_request()
+
+    @staticmethod
+    def _worker_diagnostics_snapshot(worker: Any) -> Dict[str, Any]:
+        diagnostics = getattr(worker, "diagnostics", None)
+        if not callable(diagnostics):
+            return {}
+        try:
+            value = diagnostics()
+        except Exception as exc:
+            return {"error": str(exc)}
+        return value if isinstance(value, dict) else {"value": value}
 
     def _maybe_repair_meta_answer(
         self,
@@ -1390,8 +1755,6 @@ class OpenAIAdapter:
     ) -> Tuple[str, Optional[List[Dict[str, Any]]]]:
         if tool_calls:
             return cleaned, tool_calls
-        if not has_tools or not self._has_tool_result_messages(messages):
-            return cleaned, tool_calls
         if not self._looks_like_meta_reasoning_answer(cleaned):
             return cleaned, tool_calls
 
@@ -1401,6 +1764,14 @@ class OpenAIAdapter:
             "stage=repair_meta_answer request_id=%s cleaned_chars=%s",
             request_id,
             len(cleaned or ""),
+        )
+        self._traffic_event(
+            "repair.meta.start",
+            request_id=request_id,
+            level="warning",
+            summary="hidden/meta reasoning was rejected",
+            data={"cleaned_chars": len(cleaned or ""), "has_tools": bool(has_tools)},
+            details={"rejected_answer": cleaned, "repair_prompt": repair_prompt},
         )
         try:
             repaired = self._ask_text(
@@ -1424,13 +1795,38 @@ class OpenAIAdapter:
                     len(repaired_cleaned or ""),
                     len(repaired_tool_calls or []),
                 )
+                self._traffic_event(
+                    "repair.meta.done",
+                    request_id=request_id,
+                    summary=f"tool_calls={len(repaired_tool_calls or [])} chars={len(repaired_cleaned or '')}",
+                    data={
+                        "repaired_chars": len(repaired_cleaned or ""),
+                        "tool_calls": len(repaired_tool_calls or []),
+                    },
+                    details={"repaired_answer": repaired},
+                )
                 return repaired_cleaned, repaired_tool_calls
             logger.warning(
                 "stage=repair_meta_answer_rejected request_id=%s repaired_preview=%r",
                 request_id,
                 (repaired_cleaned or repaired)[:240],
             )
+            self._traffic_event(
+                "repair.meta.rejected",
+                request_id=request_id,
+                level="warning",
+                summary="repair still looked invalid",
+                data={"repaired_chars": len(repaired_cleaned or repaired or "")},
+                details={"repaired_answer": repaired},
+            )
         except Exception as exc:
+            self._traffic_event(
+                "repair.meta.failed",
+                request_id=request_id,
+                level="warning",
+                summary=str(exc),
+                data={"error": str(exc)},
+            )
             logger.warning("stage=repair_meta_answer_failed request_id=%s error=%s", request_id, exc)
         return cleaned, tool_calls
 
@@ -1461,6 +1857,14 @@ class OpenAIAdapter:
             request_id,
             "; ".join(invalid_reasons[:4]),
         )
+        self._traffic_event(
+            "repair.tool_call.start",
+            request_id=request_id,
+            level="warning",
+            summary="; ".join(invalid_reasons[:4]),
+            data={"invalid_reasons": invalid_reasons[:20]},
+            details={"rejected_answer": answer, "repair_prompt": repair_prompt},
+        )
         try:
             repaired = self._ask_text(
                 repair_prompt,
@@ -1480,6 +1884,17 @@ class OpenAIAdapter:
                 len(repaired_tool_calls or []),
                 len(repaired_invalid or []),
             )
+            self._traffic_event(
+                "repair.tool_call.done",
+                request_id=request_id,
+                summary=f"tool_calls={len(repaired_tool_calls or [])} invalid={len(repaired_invalid or [])}",
+                data={
+                    "tool_calls": len(repaired_tool_calls or []),
+                    "invalid_after": repaired_invalid,
+                    "cleaned_chars": len(repaired_cleaned or ""),
+                },
+                details={"repaired_answer": repaired},
+            )
             if repaired_tool_calls and not repaired_invalid:
                 return repaired_cleaned, repaired_tool_calls, []
             if repaired_tool_calls:
@@ -1488,6 +1903,13 @@ class OpenAIAdapter:
                 return repaired_cleaned, None, repaired_invalid
             return cleaned, tool_calls, repaired_invalid or invalid_reasons
         except Exception as exc:
+            self._traffic_event(
+                "repair.tool_call.failed",
+                request_id=request_id,
+                level="warning",
+                summary=str(exc),
+                data={"error": str(exc), "invalid_reasons": invalid_reasons[:20]},
+            )
             logger.warning("stage=repair_invalid_tool_calls_failed request_id=%s error=%s", request_id, exc)
             return cleaned, tool_calls, invalid_reasons
 
@@ -1599,6 +2021,29 @@ class OpenAIAdapter:
         request_id = self._new_id()
         created = int(time.time())
         tool_message_count, tool_result_chars = self._content_chars_by_role(messages, "tool") if isinstance(messages, list) else (0, 0)
+        client_request_id = str(request.headers.get("X-Client-Request-Id") or "")
+        self._set_request_state(
+            request_id,
+            "received",
+            model=model,
+            stream=stream,
+            client_request_id=client_request_id,
+        )
+        self._traffic_event(
+            "http.chat.received",
+            request_id=request_id,
+            summary=f"model={model} stream={stream} messages={len(messages) if isinstance(messages, list) else 0}",
+            data={
+                "model": model,
+                "stream": stream,
+                "messages": len(messages) if isinstance(messages, list) else 0,
+                "tools": len(data.get("tools") or []),
+                "tool_messages": tool_message_count,
+                "tool_result_chars": tool_result_chars,
+                "client_request_id": client_request_id,
+            },
+            details={"request": data},
+        )
 
         logger.info(
             "chat.completions model=%s stream=%s messages=%s tools=%s tool_messages=%s tool_result_chars=%s",
@@ -1621,6 +2066,24 @@ class OpenAIAdapter:
                 len(prompt),
                 len(latest_user),
             )
+            self._set_request_state(
+                request_id,
+                "prompt_built",
+                prompt_chars=len(prompt),
+                latest_user_chars=len(latest_user),
+                conversation_key=conversation_key or "",
+            )
+            self._traffic_event(
+                "prompt.built",
+                request_id=request_id,
+                summary=f"prompt_chars={len(prompt)} latest_user_chars={len(latest_user)}",
+                data={
+                    "prompt_chars": len(prompt),
+                    "latest_user_chars": len(latest_user),
+                    "conversation_key": conversation_key or "",
+                },
+                details={"prompt": prompt},
+            )
             logger.info(
                 "stage=reasoning_route request_id=%s mode=%s use_reasoning=%s reason=%s timeout=%s",
                 request_id,
@@ -1629,11 +2092,37 @@ class OpenAIAdapter:
                 reasoning_reason,
                 timeout,
             )
+            self._traffic_event(
+                "reasoning.route",
+                request_id=request_id,
+                summary=f"use_reasoning={use_reasoning} reason={reasoning_reason}",
+                data={
+                    "mode": reasoning_mode,
+                    "use_reasoning": bool(use_reasoning),
+                    "reason": reasoning_reason,
+                    "timeout": timeout,
+                },
+            )
         except Exception as exc:
             logger.exception("Invalid chat completion request")
+            self._set_request_state(request_id, "failed", error=str(exc))
+            self._traffic_event(
+                "http.chat.invalid",
+                request_id=request_id,
+                level="error",
+                summary=str(exc),
+                data={"error": str(exc)},
+            )
             return jsonify({"error": {"message": str(exc), "type": "invalid_request_error"}}), 400
 
         if not latest_user and not any(msg.get("role") == "tool" for msg in messages if isinstance(msg, dict)):
+            self._set_request_state(request_id, "failed", error="No user or tool message")
+            self._traffic_event(
+                "http.chat.invalid",
+                request_id=request_id,
+                level="error",
+                summary="No user or tool message",
+            )
             return jsonify({"error": {"message": "No user or tool message", "type": "invalid_request_error"}}), 400
 
         if stream:
@@ -1650,6 +2139,10 @@ class OpenAIAdapter:
             )
 
         try:
+            self._request_local.request_id = request_id
+            self._set_request_state(request_id, "queued")
+            self._acquire_browser_request(request_id=request_id)
+            self._set_request_state(request_id, "active")
             logger.info(
                 "stage=deepseek_request request_id=%s mode=sync timeout=%s reasoning=%s",
                 request_id,
@@ -1664,6 +2157,7 @@ class OpenAIAdapter:
                 request_id=request_id,
             )
             logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(answer), answer[:240])
+            self._set_request_state(request_id, "validating", answer_chars=len(answer or ""))
             has_tools = bool(data.get("tools")) and data.get("tool_choice") != "none"
             tools = data.get("tools") or []
             cleaned, tool_calls, invalid_tool_calls = self._parse_assistant_answer_with_validation(
@@ -1703,18 +2197,73 @@ class OpenAIAdapter:
                 len(invalid_tool_calls or []),
                 len(cleaned or ""),
             )
+            response_payload = self._completion_response(request_id, created, model, prompt, cleaned, tool_calls, data)
+            finish_reason = "tool_calls" if tool_calls else "stop"
+            self._set_request_state(
+                request_id,
+                "completed",
+                finish_reason=finish_reason,
+                tool_calls=len(tool_calls or []),
+                cleaned_chars=len(cleaned or ""),
+                invalid_tool_calls=len(invalid_tool_calls or []),
+            )
+            self._traffic_event(
+                "http.chat.completed",
+                request_id=request_id,
+                summary=f"finish={finish_reason} tool_calls={len(tool_calls or [])} chars={len(cleaned or '')}",
+                data={
+                    "finish_reason": finish_reason,
+                    "tool_calls": len(tool_calls or []),
+                    "cleaned_chars": len(cleaned or ""),
+                    "invalid_tool_calls": invalid_tool_calls,
+                },
+                details={
+                    "raw_answer": answer,
+                    "cleaned": cleaned,
+                    "tool_calls": tool_calls or [],
+                    "response": response_payload,
+                },
+            )
             if not tool_calls:
                 self._append_context_buffer(conversation_key, latest_user, cleaned)
-            return jsonify(self._completion_response(request_id, created, model, prompt, cleaned, tool_calls, data))
+            return jsonify(response_payload)
         except AdapterCircuitOpenError as exc:
             logger.warning("DeepSeek adapter circuit is open")
+            self._set_request_state(request_id, "failed", error=str(exc), error_type="server_unavailable")
+            self._traffic_event(
+                "http.chat.failed",
+                request_id=request_id,
+                level="warning",
+                summary=str(exc),
+                data={"error_type": "server_unavailable", "error": str(exc)},
+            )
             return self._error_response(str(exc), "server_unavailable", 503, retry_after=exc.retry_after)
         except BrowserBusyError as exc:
             logger.warning("DeepSeek browser is busy")
+            self._set_request_state(request_id, "failed", error=str(exc), error_type="server_busy")
+            self._traffic_event(
+                "http.chat.failed",
+                request_id=request_id,
+                level="warning",
+                summary=str(exc),
+                data={"error_type": "server_busy", "error": str(exc)},
+            )
             return self._error_response(str(exc), "server_busy", 429)
         except Exception as exc:
             logger.exception("DeepSeek request failed")
+            self._set_request_state(request_id, "failed", error=str(exc), error_type="server_error")
+            self._traffic_event(
+                "http.chat.failed",
+                request_id=request_id,
+                level="error",
+                summary=str(exc),
+                data={"error_type": "server_error", "error": str(exc)},
+            )
             return self._error_response(str(exc), "server_error", 500)
+        finally:
+            if int(getattr(self._request_local, "browser_lock_depth", 0) or 0) > 0:
+                self._release_browser_request()
+            self._request_local.request_id = ""
 
     def _stream_chat_completion(
         self,
@@ -1776,8 +2325,14 @@ class OpenAIAdapter:
             }
 
         def generate() -> Iterator[str]:
-            yield self._sse(role_chunk())
+            self._request_local.request_id = request_id
+            locked = False
             try:
+                self._set_request_state(request_id, "queued")
+                self._acquire_browser_request(request_id=request_id)
+                locked = True
+                self._set_request_state(request_id, "active_stream")
+                yield self._sse(role_chunk())
                 mode = "stream_tools_buffered" if has_tools else "stream_parse_buffered"
                 logger.info(
                     "stage=deepseek_request request_id=%s mode=%s timeout=%s reasoning=%s",
@@ -1794,6 +2349,7 @@ class OpenAIAdapter:
                     request_id=request_id,
                 ).strip()
                 logger.info("stage=deepseek_response request_id=%s answer_chars=%s preview=%r", request_id, len(collected), collected[:240])
+                self._set_request_state(request_id, "validating_stream", answer_chars=len(collected or ""))
                 tools = data.get("tools") or []
                 cleaned, tool_calls, invalid_tool_calls = self._parse_assistant_answer_with_validation(
                     collected,
@@ -1833,6 +2389,27 @@ class OpenAIAdapter:
                     len(cleaned or ""),
                 )
                 if tool_calls:
+                    self._set_request_state(
+                        request_id,
+                        "streaming_tool_calls",
+                        tool_calls=len(tool_calls or []),
+                        invalid_tool_calls=len(invalid_tool_calls or []),
+                    )
+                    self._traffic_event(
+                        "http.chat.stream.completed",
+                        request_id=request_id,
+                        summary=f"finish=tool_calls tool_calls={len(tool_calls or [])}",
+                        data={
+                            "finish_reason": "tool_calls",
+                            "tool_calls": len(tool_calls or []),
+                            "invalid_tool_calls": invalid_tool_calls,
+                        },
+                        details={
+                            "raw_answer": collected,
+                            "cleaned": cleaned,
+                            "tool_calls": tool_calls or [],
+                        },
+                    )
                     for index, call in enumerate(tool_calls):
                         func = call.get("function", {})
                         yield self._sse(
@@ -1849,13 +2426,27 @@ class OpenAIAdapter:
                             yield self._sse(tool_delta(index, {"function": {"arguments": arg_delta}}))
                     yield self._sse(finish_chunk("tool_calls", self._usage(prompt, "", tool_calls=tool_calls, request_data=data)))
                     yield self._sse("[DONE]")
+                    self._set_request_state(request_id, "completed", finish_reason="tool_calls", tool_calls=len(tool_calls or []))
                     return
 
+                self._set_request_state(request_id, "streaming_text", cleaned_chars=len(cleaned or ""))
+                self._traffic_event(
+                    "http.chat.stream.completed",
+                    request_id=request_id,
+                    summary=f"finish=stop chars={len(cleaned or '')}",
+                    data={
+                        "finish_reason": "stop",
+                        "cleaned_chars": len(cleaned or ""),
+                        "invalid_tool_calls": invalid_tool_calls,
+                    },
+                    details={"raw_answer": collected, "cleaned": cleaned},
+                )
                 for text_delta in self._split_text(cleaned):
                     yield self._sse(content_chunk(text_delta))
                 self._append_context_buffer(conversation_key, latest_user, cleaned)
                 yield self._sse(finish_chunk("stop", self._usage(prompt, cleaned, request_data=data)))
                 yield self._sse("[DONE]")
+                self._set_request_state(request_id, "completed", finish_reason="stop", cleaned_chars=len(cleaned or ""))
             except Exception as exc:
                 logger.exception("Streaming DeepSeek request failed")
                 if isinstance(exc, AdapterCircuitOpenError):
@@ -1864,9 +2455,21 @@ class OpenAIAdapter:
                     error_type = "server_busy"
                 else:
                     error_type = "server_error"
+                self._set_request_state(request_id, "failed", error=str(exc), error_type=error_type)
+                self._traffic_event(
+                    "http.chat.stream.failed",
+                    request_id=request_id,
+                    level="error" if error_type == "server_error" else "warning",
+                    summary=str(exc),
+                    data={"error_type": error_type, "error": str(exc)},
+                )
                 error_payload = {"error": {"message": str(exc), "type": error_type}}
                 yield self._sse(error_payload)
                 yield self._sse("[DONE]")
+            finally:
+                if locked and int(getattr(self._request_local, "browser_lock_depth", 0) or 0) > 0:
+                    self._release_browser_request()
+                self._request_local.request_id = ""
 
         return Response(
             stream_with_context(generate()),

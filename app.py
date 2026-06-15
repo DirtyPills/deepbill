@@ -39,6 +39,7 @@ def default_settings() -> dict[str, Any]:
         "timeout_sec": DEFAULT_TIMEOUT_SEC,
         "answer_stable_sec": DEFAULT_ANSWER_STABLE_SEC,
         "reasoning_mode": "off",
+        "detailed_file_log": True,
     }
 
 
@@ -66,6 +67,7 @@ def load_settings(path: Path) -> dict[str, Any]:
         "timeout_sec": max(30, timeout),
         "answer_stable_sec": stable,
         "reasoning_mode": reasoning_mode,
+        "detailed_file_log": bool(raw.get("detailed_file_log", base["detailed_file_log"])),
     }
 
 
@@ -83,6 +85,7 @@ class DBillChatApp:
         self.timeout_sec = int(self.settings["timeout_sec"])
         self.answer_stable_sec = clamp_answer_stable_sec(self.settings["answer_stable_sec"])
         self.reasoning_mode = normalize_reasoning_mode(self.settings["reasoning_mode"])
+        self.detailed_file_log = bool(self.settings["detailed_file_log"])
         self.adapter_port = int(self.settings["adapter_port"])
         self.openai_adapter: OpenAIAdapter | None = None
 
@@ -97,6 +100,7 @@ class DBillChatApp:
         self.timeout_var = tk.StringVar(value=str(self.timeout_sec))
         self.answer_stable_var = tk.StringVar(value=f"{self.answer_stable_sec:g}")
         self.reasoning_mode_var = tk.StringVar(value=self.reasoning_mode)
+        self.detailed_file_log_var = tk.BooleanVar(value=self.detailed_file_log)
         self.chat_prompt_var = tk.StringVar(value="")
 
         self.browser = BrowserWorker(
@@ -167,6 +171,22 @@ class DBillChatApp:
         reasoning_combo.bind("<<ComboboxSelected>>", lambda _event: self._apply_reasoning_mode())
         ttk.Button(reasoning_row, text="Apply", command=self._apply_reasoning_mode).pack(side=tk.LEFT)
 
+        log_row = ttk.Frame(adapter)
+        log_row.pack(fill=tk.X, pady=(8, 0))
+        ttk.Checkbutton(
+            log_row,
+            text="Detailed file log",
+            variable=self.detailed_file_log_var,
+            command=self._apply_detailed_file_log,
+        ).pack(side=tk.LEFT)
+        self.traffic_log_path_var = tk.StringVar(value="")
+        ttk.Label(log_row, textvariable=self.traffic_log_path_var, foreground="gray").pack(side=tk.LEFT, padx=(12, 0))
+
+        traffic = ttk.LabelFrame(shell, text="Adapter Traffic", padding=10)
+        traffic.pack(fill=tk.BOTH, expand=False, pady=(0, 10))
+        self.api_log = scrolledtext.ScrolledText(traffic, wrap=tk.WORD, state=tk.NORMAL, height=8)
+        self.api_log.pack(fill=tk.BOTH, expand=True)
+
         chat = ttk.LabelFrame(shell, text="Manual Chat", padding=10)
         chat.pack(fill=tk.BOTH, expand=True)
         ask_row = ttk.Frame(chat)
@@ -186,17 +206,42 @@ class DBillChatApp:
         self.log.insert(tk.END, f"[{stamp}] {who}: {text}\n")
         self.log.see(tk.END)
 
+    def _api_log(self, record: dict[str, Any]) -> None:
+        stamp = time.strftime("%H:%M:%S")
+        stage = str(record.get("stage") or "")
+        request_id = str(record.get("request_id") or "")
+        short_id = request_id.split("-", 1)[-1][:8] if request_id else "-"
+        summary = str(record.get("summary") or "")
+        line = f"[{stamp}] {short_id} {stage}: {summary}\n"
+        self.api_log.insert(tk.END, line)
+        self.api_log.see(tk.END)
+
+    def _adapter_event(self, record: dict[str, Any]) -> None:
+        self.root.after(0, lambda: self._api_log(record))
+
     def _async(self, name: str, action) -> None:
         threading.Thread(target=action, name=name, daemon=True).start()
 
     def _start_adapter(self) -> None:
         if self.openai_adapter is not None and self.openai_adapter.is_running:
             return
-        self.openai_adapter = OpenAIAdapter(browser_worker=self.browser, port=self.adapter_port)
+        self.openai_adapter = OpenAIAdapter(
+            browser_worker=self.browser,
+            port=self.adapter_port,
+            detailed_logging=bool(self.detailed_file_log_var.get()),
+            event_sink=self._adapter_event,
+        )
         self.openai_adapter.start()
         self.settings["adapter_enabled"] = True
         self._persist_settings()
         self._log("System", f"Adapter started at {self.openai_adapter.get_url()}")
+        self._api_log(
+            {
+                "stage": "adapter.started",
+                "request_id": "",
+                "summary": f"{self.openai_adapter.get_url()} log={self.openai_adapter.get_traffic_log_path()}",
+            }
+        )
         self._update_adapter_ui()
 
     def _stop_adapter(self) -> None:
@@ -207,6 +252,7 @@ class DBillChatApp:
         self.settings["adapter_enabled"] = False
         self._persist_settings()
         self._log("System", "Adapter stopped.")
+        self._api_log({"stage": "adapter.stopped", "request_id": "", "summary": "stopped"})
         self._update_adapter_ui()
 
     def _toggle_adapter(self) -> None:
@@ -266,6 +312,22 @@ class DBillChatApp:
         self.settings["reasoning_mode"] = self.reasoning_mode
         self._persist_settings()
         self._log("System", f"Reasoning mode set to {self.reasoning_mode}.")
+
+    def _apply_detailed_file_log(self) -> None:
+        enabled = bool(self.detailed_file_log_var.get())
+        self.detailed_file_log = enabled
+        self.settings["detailed_file_log"] = enabled
+        self._persist_settings()
+        if self.openai_adapter is not None:
+            self.openai_adapter.set_detailed_logging(enabled)
+        self._log("System", f"Detailed file log {'enabled' if enabled else 'disabled'}.")
+        self._api_log(
+            {
+                "stage": "traffic_log.mode",
+                "request_id": "",
+                "summary": "detailed=on" if enabled else "detailed=off",
+            }
+        )
 
     def _copy_url(self) -> None:
         value = self.adapter_url_var.get().strip()
@@ -334,10 +396,12 @@ class DBillChatApp:
             self.adapter_toggle_button.config(text="Stop Adapter")
             self.adapter_status_label.config(text="Status: running", foreground="green")
             self.adapter_url_var.set(self.openai_adapter.get_url())
+            self.traffic_log_path_var.set(f"Log: {self.openai_adapter.get_traffic_log_path()}")
             return
         self.adapter_toggle_button.config(text="Start Adapter")
         self.adapter_status_label.config(text="Status: stopped", foreground="gray")
         self.adapter_url_var.set("")
+        self.traffic_log_path_var.set("Log: logs/adapter_traffic.jsonl")
 
     def _persist_settings(self) -> None:
         save_settings(self.settings_path, self.settings)

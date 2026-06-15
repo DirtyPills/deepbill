@@ -51,6 +51,8 @@ class DiagnosticWorker:
         self.slow_release = threading.Event()
         self.web_search_started = threading.Event()
         self.web_search_release = threading.Event()
+        self.repair_started = threading.Event()
+        self.repair_release = threading.Event()
 
     def status(self):
         return True, True, None
@@ -205,6 +207,10 @@ class DiagnosticWorker:
                 'tool_call\nCopy\nDownload\n{"name":"edit_existing_file",'
                 '"arguments":{"filepath":"style.css","changes":"body {\\n  color: #e67e22;\\n}"}}'
             )
+        if "plain meta leak marker" in low and "previous assistant response was rejected" in low:
+            return "Готово: служебная инструкция не отдана пользователю."
+        if "plain meta leak marker" in low:
+            return "Answer as the assistant. Return only the final user-visible answer."
         if "meta repair marker" in low and "previous assistant response was rejected" in low:
             return "Готово: файл прочитан и результат учтен."
         if "meta repair marker" in low and "tool result (read_file" in low:
@@ -237,6 +243,17 @@ class DiagnosticWorker:
             )
         if "invalid write file marker" in low:
             return 'tool_call {"name":"write_to_file","arguments":{"path":"index.html"}}'
+        if "interleaving repair marker" in low and "previous assistant response contained invalid tool_call" in low:
+            self.repair_started.set()
+            self.repair_release.wait(timeout=5)
+            return (
+                '```tool_call\n{"name":"write_to_file",'
+                '"arguments":{"path":"ordered.html","content":"<h1>Ordered OK</h1>"}}\n```'
+            )
+        if "interleaving repair marker" in low:
+            return 'tool_call {"name":"write_to_file","arguments":{"path":"ordered.html"}}'
+        if "second during repair marker" in low:
+            return "Второй запрос выполнен после repair."
         if "tool result (" in low or "created" in low:
             return "Готово: результат инструмента учтен."
         if "content array marker" in low:
@@ -328,6 +345,10 @@ def main() -> None:
         "default off mode keeps reasoning disabled",
     )
     assert_true(last_plain_call["request_id"].startswith("chatcmpl-"), "adapter passes request_id to worker")
+    assert_true(
+        "Write user-visible prose only in Russian" in worker.prompts[-1],
+        "adapter prompt pins final prose to Russian",
+    )
 
     status, forced_reasoning = request_json(
         "/chat/completions",
@@ -363,6 +384,15 @@ def main() -> None:
         "health exposes request journal diagnostics",
     )
     assert_true("adapter" in health["diagnostics"], "health exposes adapter queue diagnostics")
+    assert_true("traffic_log" in health["diagnostics"], "health exposes adapter traffic log diagnostics")
+    assert_true(
+        str(health["diagnostics"]["traffic_log"].get("path") or "").endswith("adapter_traffic.jsonl"),
+        "traffic log diagnostics expose jsonl path",
+    )
+    traffic_log_path = Path(str(health["diagnostics"]["traffic_log"].get("path") or ""))
+    assert_true(traffic_log_path.exists(), "traffic jsonl file is created")
+    traffic_log_text = traffic_log_path.read_text(encoding="utf-8")
+    assert_true("http.chat.received" in traffic_log_text, "traffic jsonl records incoming chat requests")
 
     status, auto_simple = request_json(
         "/chat/completions",
@@ -832,6 +862,69 @@ def main() -> None:
     assert_true(
         any("previous assistant response contained invalid tool_call" in prompt.lower() for prompt in repair_prompts),
         "missing Roo write content triggers repair prompt before native tool_call",
+    )
+
+    adapter.queue_limit = 1
+    adapter_module.BROWSER_BUSY_TIMEOUT_SEC = 5.0
+    worker.repair_started.clear()
+    worker.repair_release.clear()
+    interleave_first: dict[str, Any] = {}
+    interleave_second: dict[str, Any] = {}
+    prompts_before_interleave = len(worker.prompts)
+
+    def run_interleaving_repair_request() -> None:
+        interleave_first["status"], interleave_first["body"] = request_json(
+            "/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "interleaving repair marker: создай ordered.html"}],
+                "tools": roo_write_tool,
+                "timeout": 30,
+            },
+        )
+
+    def run_second_during_repair_request() -> None:
+        interleave_second["status"], interleave_second["body"] = request_json(
+            "/chat/completions",
+            {"messages": [{"role": "user", "content": "second during repair marker: короткий запрос"}], "timeout": 30},
+        )
+
+    repair_thread = threading.Thread(target=run_interleaving_repair_request, name="interleaving-repair-request")
+    repair_thread.start()
+    assert_true(worker.repair_started.wait(timeout=2), "interleaving repair request reached repair prompt")
+    second_thread = threading.Thread(target=run_second_during_repair_request, name="second-during-repair-request")
+    second_thread.start()
+    time.sleep(0.2)
+    prompts_during_repair = worker.prompts[prompts_before_interleave:]
+    assert_true(
+        not any("second during repair marker" in prompt.lower() for prompt in prompts_during_repair),
+        "second request does not reach worker while first request is repairing",
+    )
+    worker.repair_release.set()
+    repair_thread.join(timeout=5)
+    second_thread.join(timeout=5)
+    assert_true(interleave_first.get("status") == 200, "interleaving repair request finishes")
+    assert_true(interleave_second.get("status") == 200, "queued second request finishes after repair")
+    assert_true(
+        any("second during repair marker" in prompt.lower() for prompt in worker.prompts[prompts_before_interleave:]),
+        "second request reaches worker after repair is complete",
+    )
+
+    calls_before_plain_meta = len(worker.calls)
+    status, plain_meta = request_json(
+        "/chat/completions",
+        {"messages": [{"role": "user", "content": "plain meta leak marker: дай обычный ответ"}], "timeout": 30},
+    )
+    plain_meta_calls = worker.calls[calls_before_plain_meta:]
+    plain_meta_content = plain_meta["choices"][0]["message"]["content"]
+    assert_true(status == 200, "plain meta leak request returns HTTP 200")
+    assert_true(
+        "Answer as the assistant" not in plain_meta_content,
+        "plain meta leak is repaired before client response",
+    )
+    assert_true("служебная инструкция" in plain_meta_content, "plain meta repair returns clean Russian final answer")
+    assert_true(
+        any(str(call.get("request_id", "")).endswith("-repair") for call in plain_meta_calls),
+        "plain meta leak triggers one repair request",
     )
 
     status, prose_no_tools = request_json(

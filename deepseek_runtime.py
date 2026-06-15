@@ -785,12 +785,23 @@ class DeepSeekWebClient:
         last_error: Optional[Exception] = None
         for method in methods:
             try:
+                self._journal_event("input_fill_attempt", method=method.__name__, text_chars=len(text or ""))
                 method(input_handle, text)
-                if self._input_matches_text(input_handle, text):
+                actual = self._get_input_text_or_none(input_handle)
+                matched = self._input_matches_text(input_handle, text)
+                self._journal_event(
+                    "input_fill_result",
+                    method=method.__name__,
+                    matched=bool(matched),
+                    actual_chars=len(actual or ""),
+                )
+                if matched:
                     return
             except Exception as exc:
                 last_error = exc
+                self._journal_event("input_fill_error", method=method.__name__, error=str(exc)[:240])
             self._clear_input(input_handle)
+            self._journal_event("input_cleared_after_failed_fill", method=method.__name__)
         raise RuntimeError(f"Unable to fill DeepSeek input. last_error={last_error!r}")
 
     def _clear_input(self, input_handle) -> None:
@@ -1153,6 +1164,8 @@ class DeepSeekWebClient:
         tool_call_reasoning_candidate = ""
         generation_active_ready_since: Optional[float] = None
         generation_active_candidate = ""
+        reasoning_stable_ready_since: Optional[float] = None
+        reasoning_stable_candidate = ""
         reasoning_wait_total = 0.0
         web_search_wait_total = 0.0
         self.last_continue_clicks = 0
@@ -1221,6 +1234,8 @@ class DeepSeekWebClient:
                     tool_call_reasoning_candidate = ""
                     generation_active_ready_since = None
                     generation_active_candidate = ""
+                    reasoning_stable_ready_since = None
+                    reasoning_stable_candidate = ""
                 stable_for_answer = now - last_change_ts >= self.answer_stable_sec
                 complete_tool_call = self._looks_like_complete_tool_call_answer(text)
                 if (
@@ -1310,6 +1325,44 @@ class DeepSeekWebClient:
                             last_change_ts = time.monotonic()
                             tool_call_reasoning_ready_since = None
                             tool_call_reasoning_candidate = ""
+                            self._journal_event("continue_clicked", click=continue_clicks, answer_chars=len(candidate))
+                            logging.info(
+                                "DeepSeek continuation accepted after reasoning grace: click=%s answer_chars=%s",
+                                continue_clicks,
+                                len(candidate),
+                            )
+                            time.sleep(0.5)
+                            continue
+                        return text
+                if (
+                    not snapshot.web_search_active
+                    and not snapshot.generation_active
+                    and snapshot.reasoning_active
+                    and stable_for_answer
+                    and not complete_tool_call
+                ):
+                    if reasoning_stable_candidate != text or reasoning_stable_ready_since is None:
+                        reasoning_stable_candidate = text
+                        reasoning_stable_ready_since = now
+                        self._journal_event(
+                            "stable_answer_waiting_for_reasoning_flag",
+                            answer_chars=len(text),
+                            grace_sec=TOOL_CALL_REASONING_GRACE_SEC,
+                        )
+                    elif now - reasoning_stable_ready_since >= TOOL_CALL_REASONING_GRACE_SEC:
+                        self._journal_event(
+                            "stable_answer_returned_after_reasoning_grace",
+                            answer_chars=len(text),
+                            waited_sec=round(now - reasoning_stable_ready_since, 3),
+                        )
+                        if self._click_continue_if_available():
+                            continue_clicks += 1
+                            self.last_continue_clicks = continue_clicks
+                            self.total_continue_clicks += 1
+                            continuation_prefix = candidate
+                            last_change_ts = time.monotonic()
+                            reasoning_stable_ready_since = None
+                            reasoning_stable_candidate = ""
                             self._journal_event("continue_clicked", click=continue_clicks, answer_chars=len(candidate))
                             logging.info(
                                 "DeepSeek continuation accepted after reasoning grace: click=%s answer_chars=%s",

@@ -3,5 +3,6 @@
   "adapter_port": 8080,
   "timeout_sec": 360,
   "answer_stable_sec": 2.5,
-  "reasoning_mode": "on"
+  "reasoning_mode": "on",
+  "detailed_file_log": true
 }

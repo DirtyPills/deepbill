@@ -38,6 +38,12 @@ Configure an OpenAI-compatible provider:
 - Model: `deepseek-chat`
 - API key: any placeholder value
 
+Roo Code requires native OpenAI-style tool calls. The adapter therefore never
+relies on Roo receiving XML/prose tool markup. It parses DeepSeek's web text,
+validates the call against the incoming OpenAI `tools` schema, repairs incomplete
+calls before responding, and returns `finish_reason: "tool_calls"` with native
+`message.tool_calls`.
+
 ## Endpoints
 
 - `GET /health`
@@ -76,3 +82,43 @@ When OpenAI `tools` are present, the adapter asks DeepSeek for fenced
 `tool_call` JSON blocks, parses supported dirty web-UI variants, and returns
 native `tool_calls` to the client. The client executes the tool, then sends a
 new message list containing the assistant tool call and `role: tool` result.
+
+The adapter keeps the single DeepSeek browser locked for the whole HTTP turn:
+browser request, response collection, parser validation, any repair prompt, and
+the final HTTP/SSE response. That prevents the next Roo API request from entering
+the browser while the previous response is still being repaired.
+
+The final prompt rejects hidden/meta reasoning and pins user-visible prose to
+Russian unless the user explicitly asks for another language. Tool JSON, paths,
+code, shell commands, and schema keys remain exact and are not translated.
+
+## Queue And Diagnostics
+
+Useful environment variables:
+
+```bash
+export DEEPBILL_ADAPTER_BUSY_TIMEOUT=1800
+export DEEPBILL_ADAPTER_QUEUE_LIMIT=16
+export DEEPBILL_TRAFFIC_LOG_DIR=logs
+export DEEPBILL_TRAFFIC_LOG_FILE=adapter_traffic.jsonl
+export DEEPBILL_TRAFFIC_LOG_DETAILED=1
+```
+
+`GET /health` exposes:
+
+- adapter queue counters and active request state
+- browser diagnostics, including reasoning/search/continue counters
+- the traffic log path, detailed-mode flag, and compact recent events
+
+## Traffic Journal
+
+The GUI shows a compact `Adapter Traffic` log. The detailed file log is toggled
+with `Detailed file log` and writes JSONL records such as:
+
+- `http.chat.received`
+- `queue.wait`, `queue.acquired`, `queue.released`
+- `browser.request`, `browser.response`, `browser.retry`
+- `repair.tool_call.*`, `repair.meta.*`
+- `http.chat.completed` / `http.chat.stream.completed`
+
+Detailed mode stores full prompts and answers. Keep `logs/` out of git.
