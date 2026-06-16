@@ -2606,4 +2606,4 @@ class OpenAIAdapter:
         return self._running and self._server_thread and self._server_thread.is_alive()
 
     def get_url(self) -> str:
-        return f"http://localhost:{self.port}/v1"
+        return f"http://127.0.0.1:{self.port}/v1"

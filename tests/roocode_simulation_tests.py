@@ -232,8 +232,9 @@ def tool_specs() -> list[dict[str, Any]]:
 
 
 def safe_path(workspace: Path, filepath: str) -> Path:
-    target = (workspace / filepath).resolve()
-    if not str(target).startswith(str(workspace.resolve()) + "/"):
+    workspace_root = workspace.resolve()
+    target = (workspace_root / filepath).resolve()
+    if target != workspace_root and workspace_root not in target.parents:
         raise ValueError(f"unsafe filepath: {filepath}")
     return target
 
@@ -305,6 +306,7 @@ def main() -> None:
     adapter.start()
     time.sleep(0.6)
     try:
+        assert_true(adapter.get_url() == BASE_URL, "adapter URL uses IPv4 loopback for Windows Roo clients")
         status, models = request_json("/models")
         assert_true(status == 200 and models["data"], "models endpoint is available")
         with tempfile.TemporaryDirectory() as temp_dir:
